@@ -707,7 +707,7 @@ def module_builders(parsed):
 
 def nested_invocations(mask, start, end):
     """Yield the match of each macro invocation in mask[start:end], at any depth, outside the bodies of the
-    functions there, with the offset after its closing delimiter."""
+    functions there, with the tokens inside its delimiters."""
     bodies = []
     for function in FUNCTION.finditer(mask, start, end):
         i = function.end()
@@ -717,7 +717,7 @@ def nested_invocations(mask, start, end):
             bodies.append((i, after_closing(mask, i)))
     for invocation in NESTED_INVOCATION.finditer(mask, start, end):
         if not any(body <= invocation.start() < stop for body, stop in bodies):
-            yield invocation, after_closing(mask, invocation.end() - 1)
+            yield invocation, mask[invocation.end():after_closing(mask, invocation.end() - 1) - 1]
 
 
 def readable(invoked, macros):
@@ -733,8 +733,8 @@ def readable_macros(parsed_files, builders):
               for start, end in parsed.opaque if (defined := DEFINED.search(mask, max(0, start - 100), start))]
     macros = {name for *_, name in bodies}
     while forwarding := {name for mask, start, end, name in bodies if name in macros and any(
-            (invocation["name"] in builders or not readable(invocation, macros)) and passes_name(mask[invocation.end():close - 1], METAVARIABLE)
-            for invocation, close in nested_invocations(mask, start + 1, end - 1))}:
+            (invocation["name"] in builders or not readable(invocation, macros)) and passes_name(tokens, METAVARIABLE)
+            for invocation, tokens in nested_invocations(mask, start + 1, end - 1))}:
         macros -= forwarding
     return macros
 
@@ -809,10 +809,10 @@ def hidden_declaration(file, parsed, path, builders, macros, package):
             if passes_name(mask[start + 1:end - 1], identifier):
                 return start, UNREAD
         else:
-            for nested, close in nested_invocations(mask, start + 1, end - 1):
-                if nested["name"] in builders and re.search(identifier, mask[nested.end():close - 1]):
+            for nested, tokens in nested_invocations(mask, start + 1, end - 1):
+                if nested["name"] in builders and re.search(identifier, tokens):
                     return nested.start(), BUILT
-                if nested["name"] not in INCLUDES and not readable(nested, macros) and passes_name(mask[nested.end():close - 1], identifier):
+                if nested["name"] not in INCLUDES and not readable(nested, macros) and passes_name(tokens, identifier):
                     return nested.start(), UNREAD
         if not invoked:
             continue
