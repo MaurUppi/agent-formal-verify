@@ -550,6 +550,138 @@ test("sync's fallback follows a rename made in a merge commit into each of its p
   assert.equal(lines(joined.stdout, "SYNC")[0], `SYNC ${written} from the last commit of the model files that changed no production code in core.rs`);
 });
 
+// Run git with a committer date one second after the last in this fixture, so git log's order is the order here.
+function clocked(dir) {
+  let second = 0;
+  return (...args) => {
+    const stamp = `2026-01-01T00:00:${String(++second).padStart(2, "0")}Z`;
+    const result = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", env: { ...gitEnv, GIT_AUTHOR_DATE: stamp, GIT_COMMITTER_DATE: stamp } });
+    if (result.status !== 0) assert.fail(result.stderr);
+    return result.stdout.trim();
+  };
+}
+
+test("sync's SYNC none says when the fallback stops at a merge's rename it cannot follow, and keeps reading other sources (#255)", () => {
+  const proofs = "\n#[cfg(kani)]\nmod proofs {\n    #[kani::proof]\n    fn check() { assert!(super::claim() == 1); }\n}\n";
+  const body = Array.from({ length: 12 }, (_, at) => `pub fn step${at}() -> u8 { ${at} }\n`).join("");
+  const grow = Array.from({ length: 30 }, (_, at) => `pub fn more${at}() -> u8 { ${at} }\n`).join("");
+  const status = (dir, parent) => git(dir, "diff-tree", "-M", "-r", "--name-status", parent, "HEAD").split("\n").map((line) => line.split("\t")[0].replace(/[0-9]+$/, ""));
+
+  // The parents hold the file under different old names, and the harness commit is on the branch under its own.
+  const apart = fixture();
+  git(apart, "init", "-b", "main");
+  commit(apart, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + body }, "production");
+  git(apart, "switch", "-c", "side");
+  git(apart, "mv", "src/lib.rs", "src/old.rs");
+  git(apart, "commit", "-m", "rename on the branch");
+  commit(apart, { "src/old.rs": "pub fn claim() -> u8 { 1 }\n" + body + proofs }, "harness");
+  git(apart, "switch", "main");
+  git(apart, "merge", "--no-commit", "--no-ff", "side");
+  git(apart, "mv", "src/old.rs", "src/core.rs");
+  git(apart, "commit", "-m", "merge and rename");
+  const renaming = git(apart, "rev-parse", "HEAD");
+  assert.deepEqual([status(apart, "HEAD^1"), status(apart, "HEAD^2")], [["R"], ["R"]]);
+  const other = sync(apart, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(other.status, 0, other.stdout + other.stderr);
+  assert.equal(other.stdout, `SYNC none: no commit of the model files changed only the #[cfg(kani)] items of core.rs; it did not follow src/old.rs, which the merge ${renaming} also renamed to src/core.rs; compare the model with the code in full\n`);
+
+  // Under that shape, the harness commit on the first parent under its old name is still found before the branch's rename.
+  const fork = fixture();
+  const forkAt = clocked(fork);
+  forkAt("init", "-b", "main");
+  writeFileSync(join(mkdirSync(join(fork, "src"), { recursive: true }), "lib.rs"), "pub fn claim() -> u8 { 1 }\n" + body);
+  forkAt("add", "-A");
+  forkAt("commit", "-m", "production");
+  forkAt("branch", "side");
+  writeFileSync(join(fork, "src/lib.rs"), "pub fn claim() -> u8 { 1 }\n" + body + proofs);
+  forkAt("commit", "-am", "harness");
+  const kept = forkAt("rev-parse", "HEAD");
+  forkAt("switch", "side");
+  forkAt("mv", "src/lib.rs", "src/old.rs");
+  writeFileSync(join(fork, "src/old.rs"), "pub fn extra() -> u8 { 9 }\npub fn claim() -> u8 { 1 }\n" + body);
+  forkAt("commit", "-am", "rename and production edit");
+  forkAt("switch", "main");
+  forkAt("merge", "--no-commit", "--no-ff", "side");
+  forkAt("mv", "src/old.rs", "src/core.rs");
+  forkAt("commit", "-m", "merge and rename");
+  assert.deepEqual([status(fork, "HEAD^1"), status(fork, "HEAD^2")], [["R"], ["R"]]);
+  const first = sync(fork, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(first.status, 0, first.stdout + first.stderr);
+  assert.equal(lines(first.stdout, "SYNC")[0], `SYNC ${kept} from the last commit of the model files that changed no production code in core.rs`);
+
+  // The merge grows the file past git's rename similarity against every parent, so the walk has no old path to follow.
+  const grown = fixture();
+  git(grown, "init", "-b", "main");
+  commit(grown, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" }, "production");
+  git(grown, "switch", "-c", "side");
+  commit(grown, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + proofs }, "harness");
+  git(grown, "switch", "main");
+  git(grown, "merge", "--no-commit", "--no-ff", "side");
+  git(grown, "mv", "src/lib.rs", "src/core.rs");
+  writeFileSync(join(grown, "src/core.rs"), "pub fn claim() -> u8 { 1 }\n" + proofs + grow);
+  git(grown, "commit", "-am", "merge, rename and grow");
+  const merge = git(grown, "rev-parse", "HEAD");
+  assert.deepEqual([status(grown, "HEAD^1"), status(grown, "HEAD^2")], [["A", "D"], ["A", "D"]]);
+  const none = sync(grown, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(none.status, 0, none.stdout + none.stderr);
+  assert.equal(none.stdout, `SYNC none: no commit of the model files changed only the #[cfg(kani)] items of core.rs; it stopped following src/core.rs at the merge ${merge}, since none of its parents has src/core.rs and git finds no rename to it; compare the model with the code in full\n`);
+
+  // With a second source, the walk stops following only the first, and a branch merged later adds no rename to SYNC none.
+  const two = fixture();
+  const twoAt = clocked(two);
+  twoAt("init", "-b", "main");
+  writeFileSync(join(mkdirSync(join(two, "src"), { recursive: true }), "lib.rs"), "pub fn claim() -> u8 { 1 }\n");
+  writeFileSync(join(two, "src/b.rs"), "pub fn other() -> u8 { 2 }\n");
+  writeFileSync(join(two, "README"), "notes\n");
+  twoAt("add", "-A");
+  twoAt("commit", "-m", "production");
+  twoAt("branch", "late");
+  twoAt("switch", "-c", "side");
+  writeFileSync(join(two, "src/lib.rs"), "pub fn claim() -> u8 { 1 }\n" + proofs);
+  twoAt("commit", "-am", "harness");
+  twoAt("switch", "main");
+  twoAt("merge", "--no-commit", "--no-ff", "side");
+  twoAt("mv", "src/lib.rs", "src/core.rs");
+  writeFileSync(join(two, "src/core.rs"), "pub fn claim() -> u8 { 1 }\n" + proofs + grow);
+  twoAt("commit", "-am", "merge, rename and grow");
+  const grew = twoAt("rev-parse", "HEAD");
+  twoAt("switch", "late");
+  writeFileSync(join(two, "README"), "more notes\n");
+  twoAt("commit", "-am", "notes");
+  twoAt("switch", "main");
+  twoAt("merge", "--no-ff", "--no-edit", "late");
+  const both = sync(two, ["src/core.rs", "src/b.rs", "--source", "src/core.rs", "--source", "src/b.rs"]);
+  assert.equal(both.status, 0, both.stdout + both.stderr);
+  assert.equal(both.stdout, `SYNC none: no commit of the model files changed only the #[cfg(kani)] items of core.rs, b.rs; it stopped following src/core.rs at the merge ${grew}, since none of its parents has src/core.rs and git finds no rename to it; compare the model with the code in full\n`);
+
+  // A source added after a merge is not one that the merge holds, so the walk reads on past that merge.
+  const added = fixture();
+  const addedAt = clocked(added);
+  addedAt("init", "-b", "main");
+  writeFileSync(join(mkdirSync(join(added, "src"), { recursive: true }), "a.rs"), "pub fn claim() -> u8 { 1 }\n" + body);
+  addedAt("add", "-A");
+  addedAt("commit", "-m", "production");
+  addedAt("branch", "late");
+  addedAt("switch", "-c", "side");
+  writeFileSync(join(added, "src/a.rs"), "pub fn claim() -> u8 { 1 }\n" + body.replace("{ 5 }", "{ 55 }"));
+  addedAt("commit", "-am", "production on the branch");
+  addedAt("switch", "late");
+  writeFileSync(join(added, "src/a.rs"), "pub fn claim() -> u8 { 1 }\n" + body + proofs);
+  addedAt("commit", "-am", "harness");
+  const harness = addedAt("rev-parse", "HEAD");
+  addedAt("switch", "main");
+  writeFileSync(join(added, "src/a.rs"), "pub fn m() -> u8 { 3 }\npub fn claim() -> u8 { 1 }\n" + body);
+  addedAt("commit", "-am", "production on main");
+  addedAt("merge", "--no-ff", "--no-edit", "side");
+  writeFileSync(join(added, "src/b.rs"), "pub fn other() -> u8 { 2 }\n");
+  addedAt("add", "-A");
+  addedAt("commit", "-m", "second source");
+  addedAt("merge", "--no-ff", "--no-edit", "late");
+  const later = sync(added, ["src/a.rs", "src/b.rs", "--source", "src/a.rs", "--source", "src/b.rs"]);
+  assert.equal(later.status, 0, later.stdout + later.stderr);
+  assert.equal(lines(later.stdout, "SYNC")[0], `SYNC ${harness} from the last commit of the model files that changed no production code in a.rs, b.rs`);
+});
+
 test("sync leaves a model file out of the name search when it is not also a source", () => {
   const dir = fixture();
   git(dir, "init", "-b", "main");
