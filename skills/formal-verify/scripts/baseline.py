@@ -718,11 +718,12 @@ def transcribers(mask, start, end):
         i = close
 
 
-def item_invocations(mask, start, end, macros):
+def item_invocations(mask, start, end, macros, visible):
     """Yield the match of each macro invocation at an item position in mask[start:end], with the tokens inside its
     delimiters: one that starts the tokens or follows a `;`, a `}` or an attribute, and that braces delimit or a `;`
-    follows. So does one inside a `$(...)` repetition, a `mod name {...}` body or the invocation of one of the
-    readable macros at an item position, but not one inside another group, such as a block or a function body."""
+    follows. So does one inside a `$(...)` repetition, a `mod name {...}` body or an invocation there of one of the
+    macros that `readable` takes the visible names to reach, but not one inside another group, such as a block or a
+    function body."""
     i, item = start, True
     while i < end:
         if mask[i].isspace():
@@ -732,43 +733,143 @@ def item_invocations(mask, start, end, macros):
             braced = mask[invocation.end() - 1] == "{"
             if braced or mask[close:end].lstrip().startswith(";"):
                 yield invocation, mask[invocation.end():close - 1]
-                if readable(invocation, macros):
-                    yield from item_invocations(mask, invocation.end(), close - 1, macros)
+                if readable(invocation, macros, visible):
+                    yield from item_invocations(mask, invocation.end(), close - 1, macros, visible)
             i, item = close, braced
         elif attribute := ATTRIBUTE.match(mask, i, end):
             i = after_closing(mask, attribute.end() - 1)
         elif mask.startswith("$(", i):
             close = after_closing(mask, i + 1)
-            yield from item_invocations(mask, i + 2, close - 1, macros)
+            yield from item_invocations(mask, i + 2, close - 1, macros, visible)
             i, item = close, True
         elif mask[i] in "([{":
             close = after_closing(mask, i)
             if mask[i] == "{" and INLINE_MODULE.search(mask, start, i):
-                yield from item_invocations(mask, i + 1, close - 1, macros)
+                yield from item_invocations(mask, i + 1, close - 1, macros, visible)
             i, item = close, mask[i] == "{"
         else:
             item = mask[i] == ";" or item and mask[i] in "*+?"
             i = TOKEN.match(mask, i).end()
 
 
-def readable(invoked, macros):
-    """Return whether an invocation calls one of the macros by a path inside the crate."""
-    return invoked["name"] in macros and LOCAL_PATH.fullmatch(invoked["path"])
+def readable(invoked, macros, visible):
+    """Return whether an invocation calls one of the macros by a path inside the crate or, without a path, whether
+    every definition of its name that is visible, in textual scope at the invocation, is one of the macros.
+
+    macros and visible map a macro's name to the (file, offset) keys of its `macro_rules!` definitions.
+    """
+    name = invoked["name"]
+    if not LOCAL_PATH.fullmatch(invoked["path"]):
+        return False
+    if invoked["path"]:
+        return bool(macros.get(name))
+    return bool(visible.get(name)) and visible[name] <= macros.get(name, set())
 
 
-def readable_macros(parsed_files, builders):
-    """Return the names of the `macro_rules!` macros defined in the parsed files whose invocations the record can
-    read: those whose transcribers pass no `ident` or `tt` metavariable of their arm to an invocation at an item
-    position of one of the builders or of a macro that the record cannot read."""
-    bodies = [(mask, start, end, defined[1]) for _, parsed in parsed_files for mask in (parsed.source.without_comments_or_strings,)
-              for start, end in parsed.opaque if (defined := DEFINED.search(mask, max(0, start - 100), start))]
-    macros = {name for *_, name in bodies}
-    while forwarding := {name for mask, start, end, name in bodies if name in macros and any(
-            (invocation["name"] in builders or not readable(invocation, macros)) and passes_name(tokens, rf"\$(?:{'|'.join(variables)})\b")
+def macro_definitions(parsed):
+    """Yield the start and end of the body of each `macro_rules!` macro defined in a parsed file, with its name."""
+    mask = parsed.source.without_comments_or_strings
+    for start, end in parsed.opaque:
+        if defined := DEFINED.search(mask, max(0, start - 100), start):
+            yield start, end, defined[1]
+
+
+def block_end(parsed, position):
+    """Return the end of the innermost inline module or function body around position, or infinity at the top of
+    the file."""
+    return min([module.end - 1 for module in parsed.modules if module.start <= position < module.end]
+               + [function.end - 1 for function in parsed.functions if function.body <= position < function.end], default=float("inf"))
+
+
+def readable_macros(parsed_files, builders, scope):
+    """Return the `macro_rules!` definitions in the parsed files whose invocations the record can read, by name:
+    those whose transcribers pass no `ident` or `tt` metavariable of their arm to an invocation at an item position
+    of one of the builders or of a macro that the record cannot read. A transcriber sees the macros that scope puts
+    in textual scope at the end of the module or function body around its definition, as an invocation after the
+    definition does."""
+    bodies = [(parsed.source.without_comments_or_strings, start, end, name, (file, start), scope(file, block_end(parsed, start)))
+              for file, parsed in parsed_files for start, end, name in macro_definitions(parsed)]
+    macros = {}
+    for *_, name, key, _ in bodies:
+        macros.setdefault(name, set()).add(key)
+    while forwarding := {(name, key) for mask, start, end, name, key, visible in bodies if key in macros[name] and any(
+            (invocation["name"] in builders or not readable(invocation, macros, visible)) and passes_name(tokens, rf"\$(?:{'|'.join(variables)})\b")
             for variables, begin, stop in transcribers(mask, start + 1, end - 1) if variables
-            for invocation, tokens in item_invocations(mask, begin, stop, macros))}:
-        macros -= forwarding
+            for invocation, tokens in item_invocations(mask, begin, stop, macros, visible))}:
+        for name, key in forwarding:
+            macros[name].discard(key)
     return macros
+
+
+def macro_used(source, item):
+    """Return whether a module item carries `#[macro_use]`."""
+    return any(re.sub(r"\s+", "", attribute.without_comments_or_strings) == "macro_use" for attribute in outer_attributes(source, item.start, item.keyword))
+
+
+def merged(*scopes):
+    """Return the union of maps from a macro's name to the keys of its definitions."""
+    union = {}
+    for names in scopes:
+        for name, keys in names.items():
+            union.setdefault(name, set()).update(keys)
+    return union
+
+
+LOCAL_IMPORT = re.compile(r"\buse\s+(?:\$?crate|self|super)\b[^;]*;")
+
+
+def textual_scopes(roots, edges):
+    """Return a function of a reached file and an offset in it that gives the `macro_rules!` macros visible there,
+    as a map from each name to the (file, offset) keys of its definitions.
+
+    Those are the macros in textual scope as rustc scopes them: defined earlier in the file, in scope at each
+    declaration or `include!` that leads to the file from a crate root, if every route has them, or brought in by
+    an earlier `include!` or `#[macro_use]` module declaration. A definition or declaration inside an inline module
+    counts outside the module only when the module carries `#[macro_use]`, and one inside a function body only in
+    that body. A macro that a `use crate::...`, `use self::...` or `use super::...` item in the file names is
+    visible too, through each of its definitions.
+    """
+    children, inherited, active, definitions = {}, {}, set(), {}
+    for target, routes in edges.items():
+        for declarer, declaration in routes:
+            children.setdefault(declarer, []).append((declaration, target))
+    for file in set(roots) | edges.keys():
+        try:
+            for start, _, name in macro_definitions(parse_rust(file)):
+                definitions.setdefault(name, set()).add((file, start))
+        except ValueError:
+            continue
+
+    def reaches(parsed, position, offset):
+        return all(module.start <= offset < module.end or macro_used(parsed.source, module) for module in parsed.modules if module.start <= position < module.end) and all(
+            function.body <= offset < function.end for function in parsed.functions if function.body <= position < function.end)
+
+    def local(file, offset, seen):
+        try:
+            parsed = parse_rust(file)
+        except ValueError:
+            return {}
+        mask = parsed.source.without_comments_or_strings
+        names = merged(*({name: {(file, start)}} for start, _, name in macro_definitions(parsed) if start < offset and reaches(parsed, start, offset)))
+        names = merged(names, *({word: definitions[word]} for use in LOCAL_IMPORT.finditer(mask) for word in re.findall(r"\w+", use[0]) if word in definitions))
+        for declaration, child in children.get(file, ()):
+            if child not in seen and declaration.start < offset and reaches(parsed, declaration.start, offset) and (
+                    mask.startswith("include", declaration.keyword) or macro_used(parsed.source, declaration)):
+                names = merged(names, local(child, float("inf"), seen | {child}))
+        return names
+
+    def scope(file, offset):
+        if file not in inherited:
+            if file in active:
+                return local(file, offset, {file})
+            active.add(file)
+            routes = [scope(declarer, declaration.start) for declarer, declaration in edges.get(file, ())] if file not in roots else []
+            common = set.intersection(*(set(names) for names in routes)) if routes else set()
+            inherited[file] = {name: set().union(*(names[name] for names in routes)) for name in common}
+            active.discard(file)
+        return merged(inherited[file], local(file, offset, {file}))
+
+    return scope
 
 
 def passes_name(tokens, name):
@@ -785,7 +886,7 @@ def passes_name(tokens, name):
     return False
 
 
-def hidden_declaration(file, parsed, path, builders, macros, package):
+def hidden_declaration(file, parsed, path, builders, macros, scope, package):
     """Return the offset and kind of what may load path in file where the record cannot read the cfg around it.
 
     That is a `mod name;` inside a macro or function body, with the inline modules around it in a macro body, a
@@ -838,15 +939,16 @@ def hidden_declaration(file, parsed, path, builders, macros, package):
             return start, BUILT
         if any(body <= start < body_end for body, body_end in bodies):
             continue
-        if invoked and not readable(invoked, macros):
+        visible = scope(file, start if invoked else block_end(parsed, start))
+        if invoked and not readable(invoked, macros, visible):
             if passes_name(mask[start + 1:end - 1], identifier):
                 return start, UNREAD
         else:
             regions = [(start + 1, end - 1)] if invoked else [(begin, stop) for _, begin, stop in transcribers(mask, start + 1, end - 1)]
-            for nested, tokens in (found for begin, stop in regions for found in item_invocations(mask, begin, stop, macros)):
+            for nested, tokens in (found for begin, stop in regions for found in item_invocations(mask, begin, stop, macros, visible)):
                 if nested["name"] in builders and re.search(named, tokens):
                     return nested.start(), BUILT
-                if nested["name"] not in INCLUDES and not readable(nested, macros) and passes_name(tokens, named):
+                if nested["name"] not in INCLUDES and not readable(nested, macros, visible) and passes_name(tokens, named):
                     return nested.start(), UNREAD
         if not invoked:
             continue
@@ -885,9 +987,10 @@ def declaration_guards(path):
         except ValueError:
             continue
     builders = set().union(*(module_builders(parsed) for _, parsed in parsed_files))
-    macros = readable_macros(parsed_files, builders)
+    scope = textual_scopes(roots, edges)
+    macros = readable_macros(parsed_files, builders, scope)
     for file, parsed in parsed_files:
-        if hidden := hidden_declaration(file, parsed, path, builders, macros, packages.get(file)):
+        if hidden := hidden_declaration(file, parsed, path, builders, macros, scope, packages.get(file)):
             offset, kind = hidden
             line = parsed.source.without_comments_or_strings.count("\n", 0, offset) + 1
             remedy = "if the macro declares no module, keep the module's name out of the invocation or rename the module" if kind == UNREAD else "declare the module outside macros and function bodies"
