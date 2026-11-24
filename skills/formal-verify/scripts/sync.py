@@ -15,7 +15,8 @@ why the header's commit was not used. When a model file is also a --source, such
 with its Kani harness, that fallback counts only a commit that changed the code of its
 #[cfg(kani)] items and none of its other code, whatever it did to the other model files,
 following each source back through its renames along the renaming commit's parent, so not into a branch merged after the
-rename; SYNC none follows when none of the last 100 commits of the model files it reads qualifies. Each source path is followed through every rename since
+rename; SYNC none follows when none of the last 100 commits of the model files it reads qualifies, and says so when a
+branch was merged after a rename it followed. Each source path is followed through every rename since
 the sync commit in both directions. Each name adds the files where git grep finds it as a whole
 word now, outside the model files that are not also a --source, such as a Kani harness kept
 apart from the production code, and outside documents, such as README, and TLA+ and Lean files,
@@ -164,8 +165,8 @@ def sync_commit(root, models, shared):
         names = ", ".join(model.name for model in shared)
         sources = [str(model.relative_to(root)) for model in shared]
         # git log does not follow a rename, so the walk starts again at the renaming commit's parent under the old path.
-        # A branch merged after the rename is not followed back past it.
-        paths, start, left, more = relative, "HEAD", FALLBACK_COMMITS, False
+        # A branch merged after the rename is not followed back past it, and SYNC none says so.
+        paths, start, left, more, followed = relative, "HEAD", FALLBACK_COMMITS, False, None
         while left:
             commits = git(root, "log", f"-{left + 1}", "--format=%H", start, "--", *paths).stdout.split()
             more, renames = len(commits) > left, {}
@@ -179,9 +180,13 @@ def sync_commit(root, models, shared):
             if not renames:
                 break
             paths, sources = ([renames.get(path, path) for path in group] for group in (paths, sources))
-            start, more = f"{commit}^", True
+            start, more, followed = f"{commit}^", True, commit
         read = f"the last {FALLBACK_COMMITS} commits of the model files" if more and not left else "the model files"
-        return None, "; ".join([f"no commit of {read} changed only the #[cfg(kani)] items of {names}", *unused])
+        reasons = [f"no commit of {read} changed only the #[cfg(kani)] items of {names}"]
+        # The oldest rename followed is an ancestor of the others, so its merges since include theirs.
+        if followed and git(root, "rev-list", "--merges", "-1", f"{followed}..HEAD").stdout.strip():
+            reasons.append(f"it did not follow the rename in {followed} into a branch merged after it")
+        return None, "; ".join([*reasons, *unused])
     last = git(root, "log", "-1", "--format=%H", "--", *relative).stdout.strip()
     if last:
         return last, "; ".join(["from the last commit of the model files", *unused])

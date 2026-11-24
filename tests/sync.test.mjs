@@ -416,6 +416,49 @@ test("sync's fallback counts #[cfg(kani)] on an item only, follows a rename, and
   assert.equal(long.stdout, "SYNC none: no commit of the last 100 commits of the model files changed only the #[cfg(kani)] items of core.rs; compare the model with the code in full\n");
 });
 
+test("sync's SYNC none says when the fallback did not follow a rename into a branch merged after it (#220)", () => {
+  const proofs = "\n#[cfg(kani)]\nmod proofs {\n    #[kani::proof]\n    fn check() { assert!(super::claim() == 1); }\n}\n";
+  // The harness commit is on a branch merged after the rename, under the old name.
+  const side = fixture();
+  git(side, "init", "-b", "main");
+  commit(side, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" }, "production");
+  git(side, "switch", "-c", "side");
+  commit(side, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + proofs }, "harness");
+  git(side, "switch", "main");
+  git(side, "mv", "src/lib.rs", "src/core.rs");
+  git(side, "commit", "-m", "rename");
+  const rename = git(side, "rev-parse", "HEAD");
+  git(side, "merge", "--no-edit", "side");
+  const merged = sync(side, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(merged.status, 0, merged.stdout + merged.stderr);
+  assert.equal(merged.stdout, `SYNC none: no commit of the model files changed only the #[cfg(kani)] items of core.rs; it did not follow the rename in ${rename} into a branch merged after it; compare the model with the code in full\n`);
+
+  // The mirror case: the rename is on the branch and the harness commit on main.
+  const mirror = fixture();
+  git(mirror, "init", "-b", "main");
+  commit(mirror, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" }, "production");
+  git(mirror, "switch", "-c", "side");
+  git(mirror, "mv", "src/lib.rs", "src/core.rs");
+  git(mirror, "commit", "-m", "rename");
+  const moved = git(mirror, "rev-parse", "HEAD");
+  git(mirror, "switch", "main");
+  commit(mirror, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + proofs }, "harness");
+  git(mirror, "merge", "--no-edit", "side");
+  const both = sync(mirror, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(both.status, 0, both.stdout + both.stderr);
+  assert.equal(both.stdout, `SYNC none: no commit of the model files changed only the #[cfg(kani)] items of core.rs; it did not follow the rename in ${moved} into a branch merged after it; compare the model with the code in full\n`);
+
+  // With no merge after the rename, SYNC none says nothing of a branch.
+  const plain = fixture();
+  git(plain, "init", "-b", "main");
+  commit(plain, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + proofs }, "production and harness");
+  git(plain, "mv", "src/lib.rs", "src/core.rs");
+  git(plain, "commit", "-m", "rename");
+  const linear = sync(plain, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(linear.status, 0, linear.stdout + linear.stderr);
+  assert.equal(linear.stdout, "SYNC none: no commit of the model files changed only the #[cfg(kani)] items of core.rs; compare the model with the code in full\n");
+});
+
 test("sync leaves a model file out of the name search when it is not also a source", () => {
   const dir = fixture();
   git(dir, "init", "-b", "main");
