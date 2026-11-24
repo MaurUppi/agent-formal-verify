@@ -666,6 +666,16 @@ test("a route to a Kani harness file through include! is followed, and one that 
   assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! declare { ($m:ident) => { mod $m; } }\nmacro_rules! wrap { ($($t:tt)*) => { $($t)* } }\nwrap! { declare!(proofs); }\n' }, "proofs.rs"), /lib\.rs:4: a macro invocation may build a module declaration that loads/);
   const checked = { "Cargo.toml": '[package]\nname = "p"\nversion = "0.1.0"\n', "src/lib.rs": "mod queue;\n", "tests/suite.rs": "macro_rules! suite {\n    ($m:ident) => { mod $m { #[test] fn works() { assert!($m::CAP > 0); } } };\n}\nsuite!(queue);\n" };
   assert.equal(guards(checked, "src/queue.rs"), "");
+  const helpers = "macro_rules! len { ($proofs:expr, $n:expr) => { assert_eq!($proofs.len(), $n) }; }\nmacro_rules! empty { ($q:expr) => {{ let proofs = $q; assert!(proofs.is_empty()); }}; }\nmacro_rules! show { () => { println!(\"{}\", proofs) }; }\n";
+  assert.equal(guards({ "lib.rs": `mod proofs;\n${helpers}` }, "proofs.rs"), "");
+  assert.equal(guards({ "lib.rs": "mod proofs;\nmacro_rules! m { ($name:ident, $c:expr) => { const _: () = if !($c) { panic!() }; pub struct $name; }; }\nm!(proofs, true);\n" }, "proofs.rs"), "");
+  assert.equal(guards({ "lib.rs": "mod proofs;\nmacro_rules! check { ($name:ident, $e:expr) => { const _: () = assert!($e); pub struct $name; }; }\ncheck!(proofs, 1 > 0);\n" }, "proofs.rs"), "");
+  assert.equal(guards({ "lib.rs": 'mod proofs;\nmacro_rules! suite { ($name:ident) => { #[doc = concat!("Tests for ", stringify!($name))] mod $name {} }; }\nsuite!(proofs);\n' }, "proofs.rs"), "");
+  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! wrap { (fn $m:ident) => { builders::declare!($m); }; }\nwrap!(fn proofs);\n' }, "proofs.rs"), forwarded);
+  const callback = "mod proofs;\nmacro_rules! strip { ($mac:ident!($($t:tt)*)) => { $mac!([] $($t)*); }; }\nmacro_rules! shape {\n    ([] struct $name:ident { $($f:tt)* }) => { struct $name { $($f)* } };\n    ($($t:tt)*) => { strip!(shape!($($t)*)); };\n}\nshape! { struct S { proofs: u8 } }\n";
+  assert.equal(guards({ "lib.rs": callback }, "proofs.rs"), "");
+  const pointer ='#[path = "outer/proofs.rs"] mod readable;\nmacro_rules! wrap { ($m:ident) => { pub struct S { pub f: fn() } pub mod outer { builders::declare!($m); } }; }\nwrap!(proofs);\n';
+  assert.match(failure({ "lib.rs": pointer }, "outer/proofs.rs"), /lib\.rs:3: an invocation of a macro that the record cannot read/);
   const uses = "mod queue;\nconst _: () = assert!(queue::CAP > 0);\ncfg_if::cfg_if! { if #[cfg(feature = \"std\")] { pub use queue::Queue; } }\n";
   assert.equal(guards({ "lib.rs": uses + "proptest::proptest! { #[test] fn push(x in 0u8..4) { let queue = x; let _ = self.queue; } }\n" }, "queue.rs"), "");
   assert.equal(guards({ "lib.rs": '#[cfg(kani)] mod kani;\ncfg_if::cfg_if! { if #[cfg(kani)] { const K: u8 = 1; } }\n' }, "kani/mod.rs"), "");

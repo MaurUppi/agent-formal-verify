@@ -688,9 +688,12 @@ HIDDEN_MODULE = re.compile(r"\bmod\s+((?:r#)?\w+)\s*\{")
 INVOKED = re.compile(r"(?P<path>(?:::\s*)?(?:\w+\s*::\s*)*)(?P<name>\w+)\s*!\s*$")
 LOCAL_PATH = re.compile(r"(?:(?:crate|self|super)\s*::\s*(?:\w+\s*::\s*)*)?")
 DEFINED = re.compile(r"\bmacro_rules\s*!\s*(\w+)\s*$")
-NESTED_INVOCATION = re.compile(r"(?P<path>(?:::\s*)?(?:\w+\s*::\s*)*)(?P<name>\w+)\s*!\s*[(\[{]")
-FUNCTION = re.compile(r"\bfn\b")
-METAVARIABLE = r"\$\w+"
+ITEM_INVOCATION = re.compile(r"(?:\$(?=crate\b))?(?P<path>(?:::\s*)?(?:\w+\s*::\s*)*)(?P<name>\w+)\s*!\s*[(\[{]")
+INLINE_MODULE = re.compile(r"\bmod\s+\$?\w+\s*$")
+TOKEN = re.compile(r"\$?\w+|.", re.DOTALL)
+OPENER = re.compile(r"[(\[{]")
+ARM = re.compile(r"\s*=>\s*[(\[{]")
+NAME_FRAGMENT = re.compile(r"\$(\w+)\s*:\s*(?:ident|tt)\b")
 INCLUDES = ("include", "include_str", "include_bytes")
 INCLUDE_CALL = re.compile(r"\binclude\s*!\s*[(\[{]")
 HIDDEN = "a module declaration inside a macro or function body may load"
@@ -705,19 +708,47 @@ def module_builders(parsed):
     return {defined[1] for start, end in parsed.opaque if (defined := DEFINED.search(mask, max(0, start - 100), start)) and re.search(r"\bmod\s+\$\w+\s*;", mask[start:end])}
 
 
-def nested_invocations(mask, start, end):
-    """Yield the match of each macro invocation in mask[start:end], at any depth, outside the bodies of the
-    functions there, with the tokens inside its delimiters."""
-    bodies = []
-    for function in FUNCTION.finditer(mask, start, end):
-        i = function.end()
-        while i < end and mask[i] not in "{;":
-            i = after_closing(mask, i) if mask[i] in "([" else i + 1
-        if i < end and mask[i] == "{":
-            bodies.append((i, after_closing(mask, i)))
-    for invocation in NESTED_INVOCATION.finditer(mask, start, end):
-        if not any(body <= invocation.start() < stop for body, stop in bodies):
-            yield invocation, mask[invocation.end():after_closing(mask, invocation.end() - 1) - 1]
+def transcribers(mask, start, end):
+    """Yield the names of the `ident` and `tt` metavariables of each arm of the `macro_rules!` body mask[start:end],
+    with the start and end of the tokens inside the arm's transcriber."""
+    i = start
+    while (matcher := OPENER.search(mask, i, end)) and (arrow := ARM.match(mask, after_closing(mask, matcher.start()))):
+        close = after_closing(mask, arrow.end() - 1)
+        yield set(NAME_FRAGMENT.findall(mask, matcher.start(), arrow.start())), arrow.end(), close - 1
+        i = close
+
+
+def item_invocations(mask, start, end, macros):
+    """Yield the match of each macro invocation at an item position in mask[start:end], with the tokens inside its
+    delimiters: one that starts the tokens or follows a `;`, a `}` or an attribute, and that braces delimit or a `;`
+    follows. So does one inside a `$(...)` repetition, a `mod name {...}` body or the invocation of one of the
+    readable macros at an item position, but not one inside another group, such as a block or a function body."""
+    i, item = start, True
+    while i < end:
+        if mask[i].isspace():
+            i += 1
+        elif item and (invocation := ITEM_INVOCATION.match(mask, i, end)):
+            close = after_closing(mask, invocation.end() - 1)
+            braced = mask[invocation.end() - 1] == "{"
+            if braced or mask[close:end].lstrip().startswith(";"):
+                yield invocation, mask[invocation.end():close - 1]
+                if readable(invocation, macros):
+                    yield from item_invocations(mask, invocation.end(), close - 1, macros)
+            i, item = close, braced
+        elif attribute := ATTRIBUTE.match(mask, i, end):
+            i = after_closing(mask, attribute.end() - 1)
+        elif mask.startswith("$(", i):
+            close = after_closing(mask, i + 1)
+            yield from item_invocations(mask, i + 2, close - 1, macros)
+            i, item = close, True
+        elif mask[i] in "([{":
+            close = after_closing(mask, i)
+            if mask[i] == "{" and INLINE_MODULE.search(mask, start, i):
+                yield from item_invocations(mask, i + 1, close - 1, macros)
+            i, item = close, mask[i] == "{"
+        else:
+            item = mask[i] == ";" or item and mask[i] in "*+?"
+            i = TOKEN.match(mask, i).end()
 
 
 def readable(invoked, macros):
@@ -727,14 +758,15 @@ def readable(invoked, macros):
 
 def readable_macros(parsed_files, builders):
     """Return the names of the `macro_rules!` macros defined in the parsed files whose invocations the record can
-    read: those whose bodies pass no metavariable to an invocation of one of the builders or of a macro that the
-    record cannot read, outside the bodies of the functions they hold."""
+    read: those whose transcribers pass no `ident` or `tt` metavariable of their arm to an invocation at an item
+    position of one of the builders or of a macro that the record cannot read."""
     bodies = [(mask, start, end, defined[1]) for _, parsed in parsed_files for mask in (parsed.source.without_comments_or_strings,)
               for start, end in parsed.opaque if (defined := DEFINED.search(mask, max(0, start - 100), start))]
     macros = {name for *_, name in bodies}
     while forwarding := {name for mask, start, end, name in bodies if name in macros and any(
-            (invocation["name"] in builders or not readable(invocation, macros)) and passes_name(tokens, METAVARIABLE)
-            for invocation, tokens in nested_invocations(mask, start + 1, end - 1))}:
+            (invocation["name"] in builders or not readable(invocation, macros)) and passes_name(tokens, rf"\$(?:{'|'.join(variables)})\b")
+            for variables, begin, stop in transcribers(mask, start + 1, end - 1) if variables
+            for invocation, tokens in item_invocations(mask, begin, stop, macros))}:
         macros -= forwarding
     return macros
 
@@ -762,8 +794,8 @@ def hidden_declaration(file, parsed, path, builders, macros, package):
     stand for, a macro invocation outside function bodies that holds a string
     naming path's file name, and an invocation of one of the builders macros that names path's module. So is an
     invocation outside function bodies of a macro that is not one of the readable macros, or that a path outside the
-    crate names, when it may pass path's module on as the name of a module it declares. The invocations inside a
-    `macro_rules!` body or a readable macro's invocation count too, outside the bodies of the functions there.
+    crate names, when it may pass path's module on as the name of a module it declares. The invocations at item
+    positions in a `macro_rules!` transcriber or a readable macro's invocation count too.
     """
     module = path.parent.name if path.name == "mod.rs" else path.stem
     names = re.compile(rf"\b{re.escape(module)}\b|{re.escape(path.name)}")
@@ -797,6 +829,7 @@ def hidden_declaration(file, parsed, path, builders, macros, package):
                 return call.start(), INCLUDED
     starts = [begin for begin, _ in parsed.source.literals]
     identifier = rf"\b{re.escape(module)}\b"
+    named = rf"(?<![$@]){identifier}"
     for start, end in parsed.opaque:
         invoked = INVOKED.search(mask, max(0, start - 100), start)
         if invoked and invoked["name"] in INCLUDES or not (invoked or DEFINED.search(mask, max(0, start - 100), start)):
@@ -809,10 +842,11 @@ def hidden_declaration(file, parsed, path, builders, macros, package):
             if passes_name(mask[start + 1:end - 1], identifier):
                 return start, UNREAD
         else:
-            for nested, tokens in nested_invocations(mask, start + 1, end - 1):
-                if nested["name"] in builders and re.search(identifier, tokens):
+            regions = [(start + 1, end - 1)] if invoked else [(begin, stop) for _, begin, stop in transcribers(mask, start + 1, end - 1)]
+            for nested, tokens in (found for begin, stop in regions for found in item_invocations(mask, begin, stop, macros)):
+                if nested["name"] in builders and re.search(named, tokens):
                     return nested.start(), BUILT
-                if nested["name"] not in INCLUDES and not readable(nested, macros) and passes_name(tokens, identifier):
+                if nested["name"] not in INCLUDES and not readable(nested, macros) and passes_name(tokens, named):
                     return nested.start(), UNREAD
         if not invoked:
             continue
