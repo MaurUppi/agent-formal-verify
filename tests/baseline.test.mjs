@@ -674,7 +674,7 @@ test("a route to a Kani harness file through include! is followed, and one that 
   assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! wrap { (fn $m:ident) => { builders::declare!($m); }; }\nwrap!(fn proofs);\n' }, "proofs.rs"), forwarded);
   const callback = "mod proofs;\nmacro_rules! strip { ($mac:ident!($($t:tt)*)) => { $mac!([] $($t)*); }; }\nmacro_rules! shape {\n    ([] struct $name:ident { $($f:tt)* }) => { struct $name { $($f)* } };\n    ($($t:tt)*) => { strip!(shape!($($t)*)); };\n}\nshape! { struct S { proofs: u8 } }\n";
   assert.equal(guards({ "lib.rs": callback }, "proofs.rs"), "");
-  const pointer ='#[path = "outer/proofs.rs"] mod readable;\nmacro_rules! wrap { ($m:ident) => { pub struct S { pub f: fn() } pub mod outer { builders::declare!($m); } }; }\nwrap!(proofs);\n';
+  const pointer = '#[path = "outer/proofs.rs"] mod readable;\nmacro_rules! wrap { ($m:ident) => { pub struct S { pub f: fn() } pub mod outer { builders::declare!($m); } }; }\nwrap!(proofs);\n';
   assert.match(failure({ "lib.rs": pointer }, "outer/proofs.rs"), /lib\.rs:3: an invocation of a macro that the record cannot read/);
   const uses = "mod queue;\nconst _: () = assert!(queue::CAP > 0);\ncfg_if::cfg_if! { if #[cfg(feature = \"std\")] { pub use queue::Queue; } }\n";
   assert.equal(guards({ "lib.rs": uses + "proptest::proptest! { #[test] fn push(x in 0u8..4) { let queue = x; let _ = self.queue; } }\n" }, "queue.rs"), "");
