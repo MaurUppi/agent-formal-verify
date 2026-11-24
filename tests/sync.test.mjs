@@ -5,26 +5,31 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import { command, fixture, keepFixture, removeFixtures, scripts } from "./helpers.mjs";
+import { command, excludes, fixture, keepFixture, removeFixtures, scripts } from "./helpers.mjs";
 
 afterEach(removeFixtures);
 
 // Git sets GIT_DIR and GIT_INDEX_FILE for a hook such as pre-commit, which runs these tests. Left in place, they
 // would point every git command here at the repository being committed to. The developer's git configuration,
-// such as commit signing, stays out of the fixture repositories too.
+// such as commit signing, stays out of the fixture repositories too. git commit and git merge would also start a
+// detached git maintenance run --auto. When git's estimate of the loose objects, taken from the objects/17
+// directory alone, passes 100, that run repacks the fixture while the test goes on committing to it and reading
+// it, and has lost objects that the test then failed to read (#201).
 const gitEnv = {
   ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("GIT_"))),
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_COUNT: "1",
+  GIT_CONFIG_KEY_0: "maintenance.auto",
+  GIT_CONFIG_VALUE_0: "false",
   GIT_AUTHOR_NAME: "Test",
   GIT_AUTHOR_EMAIL: "test@example.invalid",
   GIT_COMMITTER_NAME: "Test",
   GIT_COMMITTER_EMAIL: "test@example.invalid",
 };
 
-// The sync tests have failed now and then because git could not read an object it had just written in the fixture,
-// as "Could not read <commit>" from sync.py's git log and "unable to read tree (<tree>)" from a test's git commit
-// (#201). For such a failure, keep the fixture and say whether the object is missing or reads now.
+// When git cannot read an object in a fixture, as "Could not read <commit>" or "unable to read tree (<tree>)",
+// keep the fixture and say whether the object is missing or reads now.
 function diagnosis(dir, output) {
   const unreadable = /(?:Could not read|unable to read tree \(?)\s*([0-9a-f]{40})/.exec(output);
   if (!unreadable) return "";
@@ -717,6 +722,15 @@ test("sync's tests keep a fixture whose object git cannot read and say whether t
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("git in sync's fixtures starts no background maintenance, which repacked a fixture under a running test (#201)", () => {
+  const dir = fixture();
+  git(dir, "init", "-b", "main");
+  const trace = join(dir, ".git", "trace");
+  const result = spawnSync("git", ["-C", dir, "commit", "--allow-empty", "-m", "empty"], { encoding: "utf8", env: { ...gitEnv, GIT_TRACE: trace } });
+  assert.equal(result.status, 0, result.stderr);
+  excludes(readFileSync(trace, "utf8"), "maintenance run");
 });
 
 test("sync fails for a source path that no commit has", () => {
