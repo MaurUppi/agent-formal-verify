@@ -6,10 +6,6 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
-    ignore:
-      # ghcr.io lacks the amd64 image of v2.6.0 (ossf/scorecard-action#1752).
-      - dependency-name: ossf/scorecard-action
-        versions: ["2.6.0"]
   - package-ecosystem: pre-commit
     directory: /
     schedule:
