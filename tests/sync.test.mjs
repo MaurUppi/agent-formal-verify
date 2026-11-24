@@ -513,16 +513,16 @@ test("sync's fallback follows a rename made in a merge commit into each of its p
 
   // A merge that changed only the harness against its first parent is not the sync commit, since it joins main's code.
   const body = Array.from({ length: 12 }, (_, at) => `pub fn step${at}() -> u8 { ${at} }\n`).join("");
-  const join_ = fixture();
-  git(join_, "init", "-b", "main");
-  commit(join_, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + body }, "production");
-  git(join_, "switch", "-c", "side");
-  const written = commit(join_, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + body + proofs }, "harness");
-  git(join_, "switch", "main");
-  git(join_, "merge", "--no-commit", "--no-ff", "side");
-  git(join_, "mv", "src/lib.rs", "src/core.rs");
-  git(join_, "commit", "-m", "merge and rename");
-  const joined = sync(join_, ["src/core.rs", "--source", "src/core.rs"]);
+  const merging = fixture();
+  git(merging, "init", "-b", "main");
+  commit(merging, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + body }, "production");
+  git(merging, "switch", "-c", "side");
+  const written = commit(merging, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + body + proofs }, "harness");
+  git(merging, "switch", "main");
+  git(merging, "merge", "--no-commit", "--no-ff", "side");
+  git(merging, "mv", "src/lib.rs", "src/core.rs");
+  git(merging, "commit", "-m", "merge and rename");
+  const joined = sync(merging, ["src/core.rs", "--source", "src/core.rs"]);
   assert.equal(joined.status, 0, joined.stdout + joined.stderr);
   assert.equal(lines(joined.stdout, "SYNC")[0], `SYNC ${written} from the last commit of the model files that changed no production code in core.rs`);
 });
