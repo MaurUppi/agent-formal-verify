@@ -511,6 +511,24 @@ test("sync's fallback follows a rename made in a merge commit into each of its p
   assert.equal(parent.status, 0, parent.stdout + parent.stderr);
   assert.equal(lines(parent.stdout, "SYNC")[0], `SYNC ${kept} from the last commit of the model files that changed no production code in core.rs`);
 
+  // The READ range keeps the old path, so it shows the production change that main made before the merge.
+  const later = fixture();
+  git(later, "init", "-b", "main");
+  const rest = "\npub fn other() -> u8 { 0 }\n";
+  commit(later, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + rest }, "production");
+  git(later, "switch", "-c", "side");
+  const branch = commit(later, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + rest + proofs }, "harness");
+  git(later, "switch", "main");
+  commit(later, { "src/lib.rs": "pub fn claim() -> u8 { 2 }\n" + rest }, "production change");
+  git(later, "merge", "--no-commit", "--no-ff", "side");
+  git(later, "mv", "src/lib.rs", "src/core.rs");
+  git(later, "commit", "-m", "merge and rename");
+  const read = sync(later, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(read.status, 0, read.stdout + read.stderr);
+  assert.equal(lines(read.stdout, "SYNC")[0], `SYNC ${branch} from the last commit of the model files that changed no production code in core.rs`);
+  assert.deepEqual(lines(read.stdout, "PATH"), ["PATH src/core.rs", "PATH src/lib.rs"]);
+  assert.deepEqual(lines(read.stdout, "READ"), [`READ git -C ${git(later, "rev-parse", "--show-toplevel")} log -p ${branch}..HEAD -- src/core.rs src/lib.rs`]);
+
   // A merge that changed only the harness against its first parent is not the sync commit, since it joins main's code.
   const body = Array.from({ length: 12 }, (_, at) => `pub fn step${at}() -> u8 { ${at} }\n`).join("");
   const merging = fixture();

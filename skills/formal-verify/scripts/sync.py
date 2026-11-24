@@ -137,6 +137,8 @@ def changed_only_harness(root, commit, models, sources):
         absent = {path for path in sources
                   if all(git(root, "cat-file", "-e", f"{parent}:{path}", check=False).returncode for parent in parents)}
         renames = {}
+        if not absent:
+            return False, renames
         for parent in parents:
             for new, old in renamed_from(root, parent, commit).items():
                 if new in absent:
@@ -217,7 +219,8 @@ def sync_commit(root, models, shared):
 
 def renamed(root, sync, paths):
     """Add every path that the renames since sync connect to one of paths."""
-    fields = git(root, "log", "-M", "--diff-filter=R", "--name-status", "--format=", "-z", f"{sync}..HEAD").stdout.split("\0")
+    # -m diffs a merge against each parent, so a rename made in a merge connects its paths too.
+    fields = git(root, "log", "-m", "-M", "--diff-filter=R", "--name-status", "--format=", "-z", f"{sync}..HEAD").stdout.split("\0")
     fields = [field.lstrip("\n") for field in fields]
     pairs = [(fields[at + 1], fields[at + 2]) for at in range(len(fields) - 2) if re.fullmatch(r"R[0-9]*", fields[at])]
     paths = set(paths)
