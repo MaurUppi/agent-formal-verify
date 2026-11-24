@@ -480,6 +480,53 @@ test("sync's SYNC none says when the fallback did not follow a rename into a bra
   assert.equal(later.stdout, `SYNC none: no commit of the model files changed only the #[cfg(kani)] items of c.rs; it did not follow the rename of src/b.rs in ${second} into a branch merged after it; compare the model with the code in full\n`);
 });
 
+test("sync's fallback follows a rename made in a merge commit into each of its parents (#253)", () => {
+  const proofs = "\n#[cfg(kani)]\nmod proofs {\n    #[kani::proof]\n    fn check() { assert!(super::claim() == 1); }\n}\n";
+  // The harness commit is on the merged branch, which the file matches only under its old name.
+  const side = fixture();
+  git(side, "init", "-b", "main");
+  commit(side, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" }, "production");
+  git(side, "switch", "-c", "side");
+  const harness = commit(side, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + proofs }, "harness");
+  git(side, "switch", "main");
+  git(side, "merge", "--no-commit", "--no-ff", "side");
+  git(side, "mv", "src/lib.rs", "src/core.rs");
+  git(side, "commit", "-m", "merge and rename");
+  const merged = sync(side, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(merged.status, 0, merged.stdout + merged.stderr);
+  assert.equal(lines(merged.stdout, "SYNC")[0], `SYNC ${harness} from the last commit of the model files that changed no production code in core.rs`);
+
+  // The harness commit is on the first parent, and the merged branch changed another file.
+  const first = fixture();
+  git(first, "init", "-b", "main");
+  commit(first, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" }, "production");
+  git(first, "switch", "-c", "side");
+  commit(first, { "README.md": "notes\n" }, "notes");
+  git(first, "switch", "main");
+  const kept = commit(first, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + proofs }, "harness");
+  git(first, "merge", "--no-commit", "--no-ff", "side");
+  git(first, "mv", "src/lib.rs", "src/core.rs");
+  git(first, "commit", "-m", "merge and rename");
+  const parent = sync(first, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(parent.status, 0, parent.stdout + parent.stderr);
+  assert.equal(lines(parent.stdout, "SYNC")[0], `SYNC ${kept} from the last commit of the model files that changed no production code in core.rs`);
+
+  // A merge that changed only the harness against its first parent is not the sync commit, since it joins main's code.
+  const body = Array.from({ length: 12 }, (_, at) => `pub fn step${at}() -> u8 { ${at} }\n`).join("");
+  const join_ = fixture();
+  git(join_, "init", "-b", "main");
+  commit(join_, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + body }, "production");
+  git(join_, "switch", "-c", "side");
+  const written = commit(join_, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + body + proofs }, "harness");
+  git(join_, "switch", "main");
+  git(join_, "merge", "--no-commit", "--no-ff", "side");
+  git(join_, "mv", "src/lib.rs", "src/core.rs");
+  git(join_, "commit", "-m", "merge and rename");
+  const joined = sync(join_, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(joined.status, 0, joined.stdout + joined.stderr);
+  assert.equal(lines(joined.stdout, "SYNC")[0], `SYNC ${written} from the last commit of the model files that changed no production code in core.rs`);
+});
+
 test("sync leaves a model file out of the name search when it is not also a source", () => {
   const dir = fixture();
   git(dir, "init", "-b", "main");

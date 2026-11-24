@@ -14,8 +14,8 @@ history, and otherwise the last commit that changed the model files; the SYNC li
 why the header's commit was not used. When a model file is also a --source, such as a Rust file
 with its Kani harness, that fallback counts only a commit that changed the code of its
 #[cfg(kani)] items and none of its other code, whatever it did to the other model files,
-following each source back through its renames along the renaming commit's parent, so not into a branch merged after the
-rename; SYNC none follows when none of the last 100 commits of the model files it reads qualifies, and adds that it did
+following each source back through its renames along the renaming commit's parents, so not into a branch merged after the
+rename. A merge never counts, but a rename made in one is followed into each of its parents; SYNC none follows when none of the last 100 commits of the model files it reads qualifies, and adds that it did
 not follow a rename into a branch merged after it when such a branch changed the old path. Each source path is followed through every rename since
 the sync commit in both directions. Each name adds the files where git grep finds it as a whole
 word now, outside the model files that are not also a --source, such as a Kani harness kept
@@ -119,18 +119,34 @@ def split_harness(text):
     return code(source.uncommented[a:b] for a, b in spans), code(source.uncommented[a:b] for a, b in zip(starts, ends))
 
 
+def renamed_from(root, *trees):
+    """Map each path that a commit, or the diff between two trees, renamed to its path before."""
+    fields = git(root, "diff-tree", "-M", "-r", "--no-commit-id", "--name-status", "--diff-filter=R", "-z", *trees).stdout.split("\0")
+    return {fields[at + 2]: fields[at + 1] for at in range(len(fields) - 2) if re.fullmatch(r"R[0-9]*", fields[at])}
+
+
 def changed_only_harness(root, commit, models, sources):
     """Whether commit changed the #[cfg(kani)] items of a model file that is also a source, and no code outside them.
 
     Also returns each source that commit renamed, mapped to its path before, so the caller can follow it.
+    A merge never counts, since it joins code that the harness was not written against, but a source that
+    is in none of its parents is followed through the first parent that it renames that source from.
     """
+    parents = git(root, "rev-parse", f"{commit}^@").stdout.split()
+    if len(parents) > 1:
+        absent = {path for path in sources
+                  if all(git(root, "cat-file", "-e", f"{parent}:{path}", check=False).returncode for parent in parents)}
+        renames = {}
+        for parent in parents:
+            for new, old in renamed_from(root, parent, commit).items():
+                if new in absent:
+                    renames.setdefault(new, old)
+        return False, renames
     touched = set(git(root, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", commit, "--", *models).stdout.split("\0")) - {""}
     befores = {path: git(root, "show", f"{commit}^:{path}", check=False) for path in touched & set(sources)}
     renames = {}
     if any(before.returncode for before in befores.values()):
-        fields = git(root, "diff-tree", "-M", "-r", "--no-commit-id", "--name-status", "--diff-filter=R", "-z", commit).stdout.split("\0")
-        renames = {fields[at + 2]: fields[at + 1] for at in range(len(fields) - 2)
-                   if re.fullmatch(r"R[0-9]*", fields[at]) and fields[at + 2] in befores}
+        renames = {new: old for new, old in renamed_from(root, commit).items() if new in befores}
         befores.update({path: git(root, "show", f"{commit}^:{old}", check=False) for path, old in renames.items()})
     # A commit that changed only another model file never synced the harness in a source, so only a harness edit counts.
     changed = False
@@ -170,7 +186,7 @@ def sync_commit(root, models, shared):
     if shared:
         names = ", ".join(model.name for model in shared)
         sources = [str(model.relative_to(root)) for model in shared]
-        # git log does not follow a rename, so the walk starts again at the renaming commit's parent under the old path.
+        # git log does not follow a rename, so the walk starts again at the renaming commit's parents under the old path.
         # A branch merged after the rename is not followed back past it, and SYNC none says so.
         paths, start, left, more, followed = relative, "HEAD", FALLBACK_COMMITS, False, []
         while left:
@@ -186,7 +202,7 @@ def sync_commit(root, models, shared):
             if not renames:
                 break
             paths, sources = ([renames.get(path, path) for path in group] for group in (paths, sources))
-            start, more = f"{commit}^", True
+            start, more = f"{commit}^@", True
             followed.append((commit, sorted(set(renames.values()))))
         read = f"the last {FALLBACK_COMMITS} commits of the model files" if more and not left else "the model files"
         reasons = [f"no commit of {read} changed only the #[cfg(kani)] items of {names}"]
