@@ -447,6 +447,8 @@ test("stopping a checker bounds the time that all its ps listings take together"
   const dir = fixture();
   const realPs = spawnSync("sh", ["-c", "command -v ps"], { encoding: "utf8" }).stdout.trim();
   const listings = join(dir, "listings");
+  // Under load the time bound can end the first listing before it counts itself.
+  writeFileSync(listings, "");
   // Each slow listing names one more child of the checker, so only the time bound ends the listings.
   // The pids are above every system's pid limit, so their signals reach no process.
   command(dir, "ps", [
