@@ -1090,7 +1090,7 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
             continue
         if re.search(identifier, mask[start:end]) or names_file(start, end):
             visible = scope(file, start) if invoked else macros.every
-            if invoked and not (readable(invoked, macros, visible) and not calls_back(invoked, mask[start + 1:end - 1], visible)):
+            if invoked and (not readable(invoked, macros, visible) or calls_back(invoked, mask[start + 1:end - 1], visible)):
                 if passes_name(mask[start + 1:end - 1], identifier):
                     return start, UNREAD
             else:
@@ -1098,7 +1098,7 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
                 for nested, tokens in (found for begin, stop in regions for found in item_invocations(mask, begin, stop, macros, visible)):
                     if nested["name"] in builders and re.search(named, tokens) or nested["name"] not in INCLUDES and names_file(nested.end(), nested.end() + len(tokens)):
                         return nested.start(), BUILT
-                    if nested["name"] not in INCLUDES and not (readable(nested, macros, visible) and not (invoked and calls_back(nested, tokens, visible))) and passes_name(tokens, named):
+                    if nested["name"] not in INCLUDES and (not readable(nested, macros, visible) or invoked and calls_back(nested, tokens, visible)) and passes_name(tokens, named):
                         return nested.start(), UNREAD
         if invoked and names_file(start, end):
             return start, BUILT
