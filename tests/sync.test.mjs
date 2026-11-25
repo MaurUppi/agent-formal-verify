@@ -567,25 +567,8 @@ test("sync's SYNC none says when the fallback stops at a merge's rename it canno
   const grow = Array.from({ length: 30 }, (_, at) => `pub fn more${at}() -> u8 { ${at} }\n`).join("");
   const status = (dir, parent) => git(dir, "diff-tree", "-M", "-r", "--name-status", parent, "HEAD").split("\n").map((line) => line.split("\t")[0].replace(/[0-9]+$/, ""));
 
-  // The parents hold the file under different old names, and the harness commit is on the branch under its own.
-  const apart = fixture();
-  git(apart, "init", "-b", "main");
-  commit(apart, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + body }, "production");
-  git(apart, "switch", "-c", "side");
-  git(apart, "mv", "src/lib.rs", "src/old.rs");
-  git(apart, "commit", "-m", "rename on the branch");
-  commit(apart, { "src/old.rs": "pub fn claim() -> u8 { 1 }\n" + body + proofs }, "harness");
-  git(apart, "switch", "main");
-  git(apart, "merge", "--no-commit", "--no-ff", "side");
-  git(apart, "mv", "src/old.rs", "src/core.rs");
-  git(apart, "commit", "-m", "merge and rename");
-  const renaming = git(apart, "rev-parse", "HEAD");
-  assert.deepEqual([status(apart, "HEAD^1"), status(apart, "HEAD^2")], [["R"], ["R"]]);
-  const other = sync(apart, ["src/core.rs", "--source", "src/core.rs"]);
-  assert.equal(other.status, 0, other.stdout + other.stderr);
-  assert.equal(other.stdout, `SYNC none: no commit of the model files changed only the #[cfg(kani)] items of core.rs; it did not follow src/old.rs, which the merge ${renaming} also renamed to src/core.rs; compare the model with the code in full\n`);
-
-  // Under that shape, the harness commit on the first parent under its old name is still found before the branch's rename.
+  // The parents hold the file under different old names, and the harness commit on the first parent under its old
+  // name is found.
   const fork = fixture();
   const forkAt = clocked(fork);
   forkAt("init", "-b", "main");
@@ -680,6 +663,97 @@ test("sync's SYNC none says when the fallback stops at a merge's rename it canno
   const later = sync(added, ["src/a.rs", "src/b.rs", "--source", "src/a.rs", "--source", "src/b.rs"]);
   assert.equal(later.status, 0, later.stdout + later.stderr);
   assert.equal(lines(later.stdout, "SYNC")[0], `SYNC ${harness} from the last commit of the model files that changed no production code in a.rs, b.rs`);
+});
+
+const mergeProofs = "\n#[cfg(kani)]\nmod proofs {\n    #[kani::proof]\n    fn check() { assert!(super::claim() == 1); }\n}\n";
+const mergeBody = Array.from({ length: 12 }, (_, at) => `pub fn step${at}() -> u8 { ${at} }\n`).join("");
+const mergeGrow = Array.from({ length: 30 }, (_, at) => `pub fn more${at}() -> u8 { ${at} }\n`).join("");
+// The status letters of git diff-tree -M between a parent and HEAD, such as ["R"] for a rename or ["A", "D"] for none.
+const mergeStatus = (dir, parent) => git(dir, "diff-tree", "-M", "-r", "--name-status", parent, "HEAD").split("\n").map((line) => line.split("\t")[0].replace(/[0-9]+$/, ""));
+
+// A fixture whose branch renames src/lib.rs to src/old.rs, and whose merge renames both to src/core.rs. The first
+// parent and the branch each make a harness commit when given one, in the order given.
+function renamedApart(order) {
+  const dir = fixture();
+  const at = clocked(dir);
+  at("init", "-b", "main");
+  writeFileSync(join(mkdirSync(join(dir, "src"), { recursive: true }), "lib.rs"), "pub fn claim() -> u8 { 1 }\n" + mergeBody);
+  at("add", "-A");
+  at("commit", "-m", "production");
+  at("switch", "-c", "side");
+  at("mv", "src/lib.rs", "src/old.rs");
+  at("commit", "-m", "rename on the branch");
+  const harness = {};
+  for (const where of order) {
+    at("switch", where);
+    const file = where === "main" ? "src/lib.rs" : "src/old.rs";
+    writeFileSync(join(dir, file), "pub fn claim() -> u8 { 1 }\n" + mergeBody + mergeProofs.replace("== 1", where === "main" ? "== 1" : "> 0"));
+    at("commit", "-am", `harness on ${where}`);
+    harness[where] = at("rev-parse", "HEAD");
+  }
+  at("switch", "main");
+  at("merge", "--no-commit", "--no-ff", "-X", "theirs", "side");
+  at("mv", "src/old.rs", "src/core.rs");
+  at("commit", "-m", "merge and rename");
+  assert.deepEqual([mergeStatus(dir, "HEAD^1"), mergeStatus(dir, "HEAD^2")], [["R"], ["R"]]);
+  return { dir, harness };
+}
+
+test("sync's fallback reads each parent of a merge-made rename under that parent's own old path (#260)", () => {
+  // The harness commit is on the branch, under the branch's old name.
+  const apart = renamedApart(["side"]);
+  const other = sync(apart.dir, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(other.status, 0, other.stdout + other.stderr);
+  assert.equal(lines(other.stdout, "SYNC")[0], `SYNC ${apart.harness.side} from the last commit of the model files that changed no production code in core.rs`);
+  assert.deepEqual(lines(other.stdout, "PATH"), ["PATH src/core.rs", "PATH src/lib.rs", "PATH src/old.rs"]);
+
+  // Both parents have a harness commit under their own old names, and the later one is the sync commit.
+  for (const order of [["main", "side"], ["side", "main"]]) {
+    const both = renamedApart(order);
+    const later = sync(both.dir, ["src/core.rs", "--source", "src/core.rs"]);
+    assert.equal(later.status, 0, later.stdout + later.stderr);
+    assert.equal(lines(later.stdout, "SYNC")[0], `SYNC ${both.harness[order[1]]} from the last commit of the model files that changed no production code in core.rs`);
+  }
+});
+
+test("sync's SYNC none names a parent of a merge-made rename that git finds no rename against and that lacks the old path (#260)", () => {
+  // Code the branch adds, so that git finds no rename between the branch's file and the merge's.
+  const large = mergeGrow + mergeGrow.replaceAll("more", "most");
+
+  // A parent that still holds the other parent's old name is read under it, and SYNC none adds nothing.
+  const kept = fixture();
+  git(kept, "init", "-b", "main");
+  commit(kept, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + mergeBody }, "production");
+  git(kept, "switch", "-c", "side");
+  commit(kept, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + mergeBody + large }, "grow on the branch");
+  const held = commit(kept, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + mergeBody + large + mergeProofs }, "harness");
+  git(kept, "switch", "main");
+  git(kept, "merge", "--no-commit", "--no-ff", "side");
+  git(kept, "rm", "-f", "src/lib.rs");
+  commit(kept, { "src/core.rs": "pub fn claim() -> u8 { 1 }\n" + mergeBody + mergeProofs }, "merge and rename");
+  assert.deepEqual([mergeStatus(kept, "HEAD^1"), mergeStatus(kept, "HEAD^2")], [["R"], ["A", "D"]]);
+  const read = sync(kept, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(read.status, 0, read.stdout + read.stderr);
+  assert.equal(lines(read.stdout, "SYNC")[0], `SYNC ${held} from the last commit of the model files that changed no production code in core.rs`);
+
+  // git finds the rename against the first parent only, and the branch no longer holds the first parent's old name.
+  const hybrid = fixture();
+  git(hybrid, "init", "-b", "main");
+  commit(hybrid, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + mergeBody }, "production");
+  git(hybrid, "switch", "-c", "side");
+  git(hybrid, "mv", "src/lib.rs", "src/old.rs");
+  commit(hybrid, { "src/old.rs": "pub fn claim() -> u8 { 1 }\n" + mergeBody + large }, "rename and grow on the branch");
+  commit(hybrid, { "src/old.rs": "pub fn claim() -> u8 { 1 }\n" + mergeBody + large + mergeProofs }, "harness");
+  const branch = git(hybrid, "rev-parse", "HEAD");
+  git(hybrid, "switch", "main");
+  git(hybrid, "merge", "--no-commit", "--no-ff", "side");
+  git(hybrid, "rm", "-f", "src/old.rs");
+  commit(hybrid, { "src/core.rs": "pub fn claim() -> u8 { 1 }\n" + mergeBody + mergeProofs }, "merge and rename");
+  const merge = git(hybrid, "rev-parse", "HEAD");
+  assert.deepEqual([mergeStatus(hybrid, "HEAD^1"), mergeStatus(hybrid, "HEAD^2")], [["R"], ["A", "D"]]);
+  const named = sync(hybrid, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(named.status, 0, named.stdout + named.stderr);
+  assert.equal(named.stdout, `SYNC none: no commit of the model files changed only the #[cfg(kani)] items of core.rs; it read the parent ${branch} of the merge ${merge} under src/lib.rs, which that parent does not hold, since git finds no rename to src/core.rs against it; compare the model with the code in full\n`);
 });
 
 test("sync leaves a model file out of the name search when it is not also a source", () => {
