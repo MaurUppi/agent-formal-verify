@@ -700,6 +700,21 @@ HIDDEN = "a module declaration inside a macro or function body may load"
 BUILT = "a macro invocation may build a module declaration that loads"
 UNREAD = "an invocation of a macro that the record cannot read may build a module declaration that loads"
 INCLUDED = "an include! inside a macro or function body reads a file that may load"
+ATTRIBUTED = "an attribute macro that the record cannot read may build a module declaration that loads"
+ATTRIBUTE_PATH = re.compile(r"\s*((?:::\s*)?(?:\w+\s*::\s*)*\w+)\s*")
+INERT_TOOLS = {"rustfmt", "clippy", "diagnostic", "rustdoc", "kani", "kanitool"}
+ITEM_REWRITERS = {"tracing::instrument", "instrument", "async_trait::async_trait", "async_trait", "tokio::main", "tokio::test"}
+BUILTIN_ATTRIBUTES = {
+    "cfg", "test", "ignore", "should_panic", "bench", "derive", "automatically_derived", "macro_export", "macro_use", "proc_macro",
+    "proc_macro_derive", "proc_macro_attribute", "allow", "warn", "deny", "forbid", "expect", "deprecated", "must_use", "link",
+    "link_name", "link_ordinal", "link_section", "no_link", "no_mangle", "used", "crate_name", "crate_type", "no_builtins", "no_main",
+    "no_std", "no_implicit_prelude", "path", "recursion_limit", "type_length_limit", "panic_handler", "global_allocator",
+    "windows_subsystem", "feature", "non_exhaustive", "inline", "cold", "track_caller", "instruction_set", "target_feature", "doc",
+    "repr", "export_name", "debugger_visualizer", "collapse_debuginfo", "naked", "unsafe", "coverage", "optimize", "register_tool",
+    "allow_internal_unstable", "allow_internal_unsafe", "test_runner", "thread_local", "ffi_pure", "ffi_const", "may_dangle",
+    "patchable_function_entry", "sanitize", "const_trait", "marker", "default_lib_allocator", "needs_allocator", "compiler_builtins",
+    "profiler_runtime", "omit_gdb_pretty_printer_section", "prelude_import", "reexport_test_harness_main",
+}
 
 
 def module_builders(parsed):
@@ -921,6 +936,42 @@ def passes_name(tokens, name):
     return False
 
 
+def attribute_parts(arguments):
+    """Return the comma-separated parts inside the delimiters of an attribute's arguments."""
+    parts, depth, start = [], 0, 1
+    for i, char in enumerate(arguments[:-1]):
+        depth += (char in "([{") - (char in ")]}")
+        if char == "," and depth == 1:
+            parts.append(arguments[start:i])
+            start = i + 1
+    return parts + [arguments[start:-1]]
+
+
+def derives(content):
+    """Return whether the masked contents of an attribute are a `derive`, or a `cfg_attr` that applies one."""
+    if not (head := ATTRIBUTE_PATH.match(content)):
+        return False
+    name, arguments = re.sub(r"\s+", "", head[1]), content[head.end():].strip()
+    return name == "derive" or name == "cfg_attr" and any(derives(part) for part in attribute_parts(arguments)[1:])
+
+
+def unread_attribute(content, identifier, helpers):
+    """Return whether the masked contents of an attribute apply an attribute macro, one that is neither built in, a
+    tool's nor one of the macros that only rewrite the item they apply to, with arguments that may pass the
+    identifier on as the name of a module it declares. A `cfg_attr` counts when an attribute in its list does. With
+    helpers, for an item that a derive applies to, an attribute by a bare name is a derive's helper attribute."""
+    if not (head := ATTRIBUTE_PATH.match(content)):
+        return False
+    segments = re.sub(r"\s+", "", head[1]).removeprefix("::").split("::")
+    arguments = content[head.end():].strip()
+    if segments == ["cfg_attr"]:
+        return any(unread_attribute(part, identifier, helpers) for part in attribute_parts(arguments)[1:])
+    if segments[0] in INERT_TOOLS or "::".join(segments) in ITEM_REWRITERS or len(segments) == 1 and (
+            helpers or segments[0] in BUILTIN_ATTRIBUTES or segments[0].startswith("rustc_")):
+        return False
+    return passes_name(arguments[1:] if arguments.startswith("=") else arguments[1:-1], identifier)
+
+
 def hidden_declaration(file, parsed, path, builders, macros, scope, package):
     """Return the offset and kind of what may load path in file where the record cannot read the cfg around it.
 
@@ -991,6 +1042,23 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
         for begin, stop in parsed.source.literals[bisect.bisect_left(starts, start):bisect.bisect_left(starts, end)]:
             if Path(string_value(text[begin:stop]) or "").name == path.name:
                 return start, BUILT
+    runs = []
+    for attribute in ATTRIBUTE.finditer(mask):
+        found = attribute.start(), attribute.end(), after_closing(mask, attribute.end() - 1)
+        if runs and not mask[runs[-1][-1][2]:found[0]].strip():
+            runs[-1].append(found)
+        else:
+            runs.append([found])
+    for run in runs:
+        before = run[0][0] - 1
+        while before >= 0 and mask[before].isspace():
+            before -= 1
+        if before >= 0 and mask[before] not in ";{}":
+            continue
+        for start, opened, close in run:
+            if re.search(identifier, mask[opened:close]) and not any(begin <= start < end for begin, end in parsed.opaque + bodies) and unread_attribute(
+                    mask[opened:close - 1], identifier, any(derives(mask[other:stop - 1]) for _, other, stop in run)):
+                return start, ATTRIBUTED
     return None
 
 
@@ -1029,7 +1097,8 @@ def declaration_guards(path):
         if hidden := hidden_declaration(file, parsed, path, builders, macros, scope, packages.get(file)):
             offset, kind = hidden
             line = parsed.source.without_comments_or_strings.count("\n", 0, offset) + 1
-            remedy = "if the macro declares no module, keep the module's name out of the invocation or rename the module" if kind == UNREAD else "declare the module outside macros and function bodies"
+            remedies = {UNREAD: "if the macro declares no module, keep the module's name out of the invocation or rename the module", ATTRIBUTED: "if the attribute declares no module, keep the module's name out of its arguments or rename the module"}
+            remedy = remedies.get(kind, "declare the module outside macros and function bodies")
             raise ValueError(f"{file}:{line}: {kind} {path}, and the record cannot read the cfg around it; {remedy}")
     if path not in edges:
         unread = "".join(f"; {message}" for message, _ in broken)
