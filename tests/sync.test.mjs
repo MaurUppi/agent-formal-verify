@@ -716,6 +716,70 @@ test("sync's fallback reads each parent of a merge-made rename under that parent
   }
 });
 
+test("sync's fallback reads the walks of a merge-made rename together, newest first, and each commit once (#260)", () => {
+  // Run git with a committer date one second after the last in this fixture, for histories of more than 59 commits.
+  const ticking = (dir) => {
+    let second = 1_700_000_000;
+    return (...args) => {
+      const stamp = `@${++second} +0000`;
+      const result = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", env: { ...gitEnv, GIT_AUTHOR_DATE: stamp, GIT_COMMITTER_DATE: stamp } });
+      if (result.status !== 0) assert.fail(result.stderr);
+      return result.stdout.trim();
+    };
+  };
+  // A history of src/lib.rs on main with count production commits, after a harness commit when withHarness is set, a
+  // branch that renames the file to src/old.rs, after a harness commit of its own when withBranchHarness is set, and a
+  // merge that renames both to src/core.rs.
+  const build = (count, withHarness, withBranchHarness) => {
+    const dir = fixture();
+    const at = ticking(dir);
+    const code = (step) => "pub fn claim() -> u8 { 1 }\n" + mergeBody + Array.from({ length: step }, (_, n) => `pub fn extra${n}() -> u8 { ${n} }\n`).join("");
+    const write = (text) => writeFileSync(join(dir, "src/lib.rs"), text);
+    at("init", "-b", "main");
+    mkdirSync(join(dir, "src"));
+    write(code(0));
+    at("add", "-A");
+    at("commit", "-m", "production");
+    const harness = withHarness ? mergeProofs : "";
+    if (withHarness) {
+      write(code(0) + harness);
+      at("commit", "-am", "harness on main");
+    }
+    for (let step = 1; step <= count; step++) {
+      write(code(step) + harness);
+      at("commit", "-am", `production ${step}`);
+    }
+    at("switch", "-c", "side");
+    let branch;
+    if (withBranchHarness) {
+      write(code(count) + mergeProofs.replace("== 1", "> 0"));
+      at("commit", "-am", "harness on the branch");
+      branch = at("rev-parse", "HEAD");
+    }
+    at("mv", "src/lib.rs", "src/old.rs");
+    at("commit", "-m", "rename on the branch");
+    at("switch", "main");
+    at("merge", "--no-commit", "--no-ff", "side");
+    at("mv", "src/old.rs", "src/core.rs");
+    at("commit", "-m", "merge and rename");
+    assert.deepEqual([mergeStatus(dir, "HEAD^1"), mergeStatus(dir, "HEAD^2")], [["R"], ["R"]]);
+    return { dir, branch };
+  };
+
+  // A harness commit on main 99 commits deep, and a later one on the branch: the later one is the sync commit, though
+  // the first parent's walk alone would spend the 100 commits before the branch's.
+  const deep = build(98, true, true);
+  const later = sync(deep.dir, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(later.status, 0, later.stdout + later.stderr);
+  assert.equal(lines(later.stdout, "SYNC")[0], `SYNC ${deep.branch} from the last commit of the model files that changed no production code in core.rs`);
+
+  // 60 commits that both parents share are read once, so SYNC none does not say the walk stopped at 100 commits.
+  const shared = build(60, false, false);
+  const none = sync(shared.dir, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(none.status, 0, none.stdout + none.stderr);
+  assert.equal(none.stdout, "SYNC none: no commit of the model files changed only the #[cfg(kani)] items of core.rs; compare the model with the code in full\n");
+});
+
 test("sync's SYNC none names a parent of a merge-made rename that git finds no rename against and that lacks the old path (#260)", () => {
   // Code the branch adds, so that git finds no rename between the branch's file and the merge's.
   const large = mergeGrow + mergeGrow.replaceAll("more", "most");
