@@ -694,7 +694,16 @@ test("a route to a Kani harness file through include! is followed, and one that 
   assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\n#[builders::declare(proofs)]\nstruct S;\n' }, "proofs.rs"), attributed);
   assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\n#[declare(proofs)]\nstruct S;\nuse builders::declare;\n' }, "proofs.rs"), attributed);
   assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\n#[cfg_attr(feature = "x", builders::declare(proofs))]\nstruct S;\n' }, "proofs.rs"), attributed);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmod m {\n    #[builders::declare(proofs)]\n    struct S;\n}\n' }, "proofs.rs"), /lib\.rs:3: an attribute macro that the record cannot read/);
+  const inline = '#[path = "m/proofs.rs"] mod readable;\nmod m {\n    #[builders::declare(proofs)]\n    struct S;\n}\n';
+  assert.match(failure({ "lib.rs": inline }, "m/proofs.rs"), /lib\.rs:3: an attribute macro that the record cannot read/);
+  assert.equal(guards({ "lib.rs": inline.replace("m/proofs.rs", "proofs.rs") }, "proofs.rs"), "");
+  assert.equal(guards({ "lib.rs": "mod proofs;\n", "proofs.rs": "#[kani::proof]\nfn a() { kani::cover!(true); }\n#[cfg(test)]\nmod tests {\n    #[serial_test::serial(proofs)]\n    #[test]\n    fn t() {}\n}\n" }, "proofs.rs"), "");
+  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\ncfg_if::cfg_if! { if #[cfg(x)] { #[builders::declare(proofs)] struct S; } }\n' }, "proofs.rs"), attributed);
+  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! w { ($m:ident) => { #[builders::declare($m)] struct S; } }\nw!(proofs);\n' }, "proofs.rs"), /lib\.rs:3: an invocation of a macro that the record cannot read/);
+  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\n#[builders::declare(path = "proofs.rs")]\nstruct S;\n' }, "proofs.rs"), attributed);
+  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\n#[builders::r#declare(proofs)]\nstruct S;\n' }, "proofs.rs"), attributed);
+  assert.match(failure({ "lib.rs": '﻿#[path = "proofs.rs"] mod readable;\n#[builders::declare(proofs)]\nstruct S;\n' }, "proofs.rs"), attributed);
+  assert.equal(guards({ "lib.rs": "mod proofs;\n#[cfg_accessible(proofs)]\n#[rust_analyzer::skip(proofs)]\n#[miri::skip(proofs)]\nstruct S;\n#[derive_const(Clone)]\n#[helper(proofs)]\nstruct T;\n" }, "proofs.rs"), "");
   assert.match(failure({ "lib.rs": "mod proofs;\n#[builders::declare(proofs)]\nstruct S;\n" }, "proofs.rs"), /if the attribute declares no module, keep the module's name out of its arguments or rename the module/);
   const inert = 'mod proofs;\n#![allow(dead_code)]\n#[derive(Clone)]\n#[repr(C)]\npub struct Proofs;\n#[cfg_attr(test, derive(Debug))]\n#[doc = "proofs"]\n#[builders::declare(other, proofs::Item)]\nstruct T { #[serde(rename = "x")] proofs: u8 }\nimpl T { #[builders::declare(proofs)] fn f() {} }\nfn g() { #[builders::declare(proofs)] let x = 1; }\n#[kani::proof]\n#[cfg(proofs)]\nfn h() {}\n';
   assert.equal(guards({ "lib.rs": inert }, "proofs.rs"), "");
