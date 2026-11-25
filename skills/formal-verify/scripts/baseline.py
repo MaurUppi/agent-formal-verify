@@ -1100,11 +1100,11 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
             regions += [(begin, stop, start, ()) for _, begin, stop in transcribers(mask, start + 1, end - 1)]
     for begin, end, region, excluded in regions:
         for start, opened, close, run in item_attributes(mask, begin, end):
-            string = names_file(opened, close)
-            if not (string or re.search(named, mask[opened:close])) or any(low <= start < high for low, high in excluded):
+            file_named = names_file(opened, close)
+            if not (file_named or re.search(named, mask[opened:close])) or any(low <= start < high for low, high in excluded):
                 continue
             if (arguments := macro_arguments(mask[opened:close - 1], derived(mask, run))) and (
-                    string or any(passes_name(found, named) for found in arguments) and loads(start, region)):
+                    file_named or any(passes_name(found, named) for found in arguments) and loads(start, region)):
                 return start, ATTRIBUTED
     return None
 
