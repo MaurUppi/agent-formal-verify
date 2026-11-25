@@ -687,7 +687,7 @@ function renamedApart(order) {
   for (const where of order) {
     at("switch", where);
     const file = where === "main" ? "src/lib.rs" : "src/old.rs";
-    writeFileSync(join(dir, file), "pub fn claim() -> u8 { 1 }\n" + mergeBody + mergeProofs.replace("== 1", where === "main" ? "== 1" : "> 0"));
+    writeFileSync(join(dir, file), "pub fn claim() -> u8 { 1 }\n" + mergeBody + (where === "main" ? mergeProofs : mergeProofs.replace("== 1", "> 0")));
     at("commit", "-am", `harness on ${where}`);
     harness[where] = at("rev-parse", "HEAD");
   }

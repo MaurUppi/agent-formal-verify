@@ -213,16 +213,16 @@ def sync_commit(root, models, shared):
                 lost = [new for new in news if not any(olds[new] for olds in renames.values())]
                 stopped += [(commit, path) for path in lost]
                 paths, sources = ([path for path in group if path not in lost] for group in (paths, sources))
-                if news - set(lost):
-                    firsts = {new: next(olds[new] for olds in renames.values() if olds[new]) for new in news - set(lost)}
+                firsts = {new: next(olds[new] for olds in renames.values() if olds[new]) for new in news - set(lost)}
+                if firsts:
                     groups = {}
                     for parent, olds in renames.items():
                         mapping = {new: olds[new] or firsts[new] for new in firsts}
                         unseen += [(commit, parent, mapping[new], new) for new in firsts if not olds[new]
                                    and git(root, "cat-file", "-e", f"{parent}:{mapping[new]}", check=False).returncode]
                         groups.setdefault(tuple(sorted(mapping.items())), []).append(parent)
-                    for mapping, parents in groups.items():
-                        mapping = dict(mapping)
+                    for key, parents in groups.items():
+                        mapping = dict(key)
                         walks.append((parents, *([mapping.get(path, path) for path in group] for group in (paths, sources))))
                     followed.append((commit, sorted({old for olds in renames.values() for old in olds.values() if old})))
                     break
@@ -233,7 +233,7 @@ def sync_commit(root, models, shared):
         if hits:
             commit = git(root, "rev-list", "-1", "--no-walk", *hits).stdout.strip()
             return commit, "; ".join([f"from the last commit of the model files that changed no production code in {names}", *unused])
-        read = f"the last {FALLBACK_COMMITS} commits of the model files" if cut or walks and not left else "the model files"
+        read = f"the last {FALLBACK_COMMITS} commits of the model files" if cut or (walks and not left) else "the model files"
         reasons = [f"no commit of {read} changed only the #[cfg(kani)] items of {names}"]
         reasons += [f"it did not follow the rename of {', '.join(olds)} in {rename} into a branch merged after it"
                     for rename, olds in followed if missed_branch(root, rename, olds)]
