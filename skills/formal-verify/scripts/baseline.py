@@ -700,6 +700,24 @@ HIDDEN = "a module declaration inside a macro or function body may load"
 BUILT = "a macro invocation may build a module declaration that loads"
 UNREAD = "an invocation of a macro that the record cannot read may build a module declaration that loads"
 INCLUDED = "an include! inside a macro or function body reads a file that may load"
+ATTRIBUTED = "an attribute macro that the record cannot read may build a module declaration that loads"
+ATTRIBUTE_PATH = re.compile(r"\s*((?:::\s*)?(?:(?:r#)?\w+\s*::\s*)*(?:r#)?\w+)\s*")
+SCRIPT_HEAD = re.compile(r"﻿?(?:#!(?!\s*\[)[^\n]*)?")
+INERT_TOOLS = {"rustfmt", "clippy", "diagnostic", "rustdoc", "kani", "kanitool", "miri", "rust_analyzer"}
+ITEM_REWRITERS = {"tracing::instrument", "instrument", "async_trait::async_trait", "async_trait", "tokio::main", "tokio::test"}
+BUILTIN_ATTRIBUTES = {
+    "cfg", "test", "ignore", "should_panic", "bench", "derive", "automatically_derived", "macro_export", "macro_use", "proc_macro",
+    "proc_macro_derive", "proc_macro_attribute", "allow", "warn", "deny", "forbid", "expect", "deprecated", "must_use", "link",
+    "link_name", "link_ordinal", "link_section", "no_link", "no_mangle", "used", "crate_name", "crate_type", "no_builtins", "no_main",
+    "no_std", "no_implicit_prelude", "path", "recursion_limit", "type_length_limit", "panic_handler", "global_allocator",
+    "windows_subsystem", "feature", "non_exhaustive", "inline", "cold", "track_caller", "instruction_set", "target_feature", "doc",
+    "repr", "export_name", "debugger_visualizer", "collapse_debuginfo", "naked", "unsafe", "coverage", "optimize", "register_tool",
+    "allow_internal_unstable", "allow_internal_unsafe", "test_runner", "thread_local", "ffi_pure", "ffi_const", "may_dangle",
+    "patchable_function_entry", "sanitize", "const_trait", "marker", "default_lib_allocator", "needs_allocator", "compiler_builtins",
+    "profiler_runtime", "omit_gdb_pretty_printer_section", "prelude_import", "reexport_test_harness_main", "cfg_accessible", "cfg_eval",
+    "cfg_select", "define_opaque", "derive_const", "eii", "eii_declaration", "unsafe_eii", "autodiff_forward", "autodiff_reverse",
+    "alloc_error_handler", "contracts_requires", "contracts_ensures", "no_sanitize",
+}
 
 
 def module_builders(parsed):
@@ -784,17 +802,22 @@ def macro_definitions(parsed):
 def readable_macros(parsed_files, builders):
     """Return the `macro_rules!` definitions in the parsed files and those whose invocations the record can read:
     those whose transcribers pass no `ident` or `tt` metavariable of their arm to an invocation at an item position
-    of one of the builders or of a macro that the record cannot read. A bare name in a transcriber resolves where
-    the macro is invoked, so it may reach every definition of the name."""
+    of one of the builders or of a macro that the record cannot read, or to an attribute macro on an item there. A
+    bare name in a transcriber resolves where the macro is invoked, so it may reach every definition of the name."""
     bodies = [(parsed.source.without_comments_or_strings, start, end, name, (file, start)) for file, parsed in parsed_files for start, end, name in macro_definitions(parsed)]
     every = {}
     for *_, name, key in bodies:
         every.setdefault(name, set()).add(key)
     macros = Macros(every, {name: set(keys) for name, keys in every.items()})
+
+    def forwards(mask, begin, stop, variables):
+        passed = rf"\$(?:{'|'.join(variables)})\b"
+        return any((invocation["name"] in builders or not readable(invocation, macros, every)) and passes_name(tokens, passed)
+                   for invocation, tokens in item_invocations(mask, begin, stop, macros, every)) or any(
+            passes_name(arguments, passed) for _, opened, close, run in item_attributes(mask, begin, stop) for arguments in macro_arguments(mask[opened:close - 1], derived(mask, run)))
+
     while forwarding := {(name, key) for mask, start, end, name, key in bodies if key in macros.readable[name] and any(
-            (invocation["name"] in builders or not readable(invocation, macros, every)) and passes_name(tokens, rf"\$(?:{'|'.join(variables)})\b")
-            for variables, begin, stop in transcribers(mask, start + 1, end - 1) if variables
-            for invocation, tokens in item_invocations(mask, begin, stop, macros, every))}:
+            forwards(mask, begin, stop, variables) for variables, begin, stop in transcribers(mask, start + 1, end - 1) if variables)}:
         for name, key in forwarding:
             macros.readable[name].discard(key)
     return macros
@@ -921,6 +944,74 @@ def passes_name(tokens, name):
     return False
 
 
+def attribute_parts(arguments):
+    """Return the comma-separated parts inside the delimiters of an attribute's arguments."""
+    parts, depth, start = [], 0, 1
+    for i, char in enumerate(arguments[:-1]):
+        depth += (char in "([{") - (char in ")]}")
+        if char == "," and depth == 1:
+            parts.append(arguments[start:i])
+            start = i + 1
+    return parts + [arguments[start:-1]]
+
+
+def attribute_name(content):
+    """Return the path segments, without `r#`, and the arguments of the attribute with the masked contents, or
+    None."""
+    if not (head := ATTRIBUTE_PATH.match(content)):
+        return None
+    return [segment.removeprefix("r#") for segment in re.sub(r"\s+", "", head[1]).removeprefix("::").split("::")], content[head.end():].strip()
+
+
+def derives(content):
+    """Return whether the masked contents of an attribute are a `derive` or `derive_const`, or a `cfg_attr` that
+    applies one."""
+    if not (named := attribute_name(content)):
+        return False
+    segments, arguments = named
+    return segments in (["derive"], ["derive_const"]) or segments == ["cfg_attr"] and any(derives(part) for part in attribute_parts(arguments)[1:])
+
+
+def derived(mask, run):
+    """Return whether one of a run of attributes, each (start, start of contents, end), is a derive."""
+    return any(derives(mask[opened:close - 1]) for _, opened, close in run)
+
+
+def macro_arguments(content, helpers):
+    """Return the arguments of each attribute macro that the masked contents of an attribute apply, through a
+    `cfg_attr` too: one that is neither built in, a tool's nor one of the macros that only rewrite the item they
+    apply to. With helpers, for an item that a derive applies to, an attribute by a bare name is a derive's helper
+    attribute."""
+    if not (named := attribute_name(content)):
+        return []
+    segments, arguments = named
+    if segments == ["cfg_attr"]:
+        return [found for part in attribute_parts(arguments)[1:] for found in macro_arguments(part, helpers)]
+    if segments[0] in INERT_TOOLS or "::".join(segments) in ITEM_REWRITERS or len(segments) == 1 and (
+            helpers or segments[0] in BUILTIN_ATTRIBUTES or segments[0].startswith("rustc_")):
+        return []
+    return [arguments[1:] if arguments.startswith("=") else arguments[1:-1]]
+
+
+def item_attributes(mask, start, end):
+    """Yield the start, the start of the contents and the end of each attribute in mask[start:end] on an item, with
+    its run of adjacent attributes: a run that starts the tokens or follows a `;`, a `{` or a `}`."""
+    runs = []
+    for attribute in ATTRIBUTE.finditer(mask, start, end):
+        found = attribute.start(), attribute.end(), after_closing(mask, attribute.end() - 1)
+        if runs and not mask[runs[-1][-1][2]:found[0]].strip():
+            runs[-1].append(found)
+        else:
+            runs.append([found])
+    for run in runs:
+        before = run[0][0] - 1
+        while before >= start and (mask[before].isspace() or mask[before] == "﻿"):
+            before -= 1
+        if before < start or mask[before] in ";{}":
+            for found in run:
+                yield *found, run
+
+
 def hidden_declaration(file, parsed, path, builders, macros, scope, package):
     """Return the offset and kind of what may load path in file where the record cannot read the cfg around it.
 
@@ -938,17 +1029,22 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
     mask, text = parsed.source.without_comments_or_strings, parsed.source.uncommented
     literals = dict(parsed.source.literals)
     bodies = [(function.body, function.end) for function in parsed.functions]
+
+    def loads(position, region):
+        """Return whether a `mod module;` at position, inside the macro body that starts at region or at the top of
+        the file for None, with the inline modules around it there, may load path."""
+        declaration = RustFunction(module, position, position, position, position + 1)
+        inner = []
+        if region is not None:
+            for opening in HIDDEN_MODULE.finditer(mask, region, position):
+                if position < (close := after_closing(mask, opening.end() - 1)):
+                    boundary = max([region] + [mask.rfind(c, region, opening.start()) for c in ";{}"]) + 1
+                    inner.append(RustFunction(opening[1], boundary, opening.start(), opening.end() - 1, close))
+        return any(target.is_file() and target.resolve() == path for owner in (True, False) for target, _ in module_files(file, owner, parsed, declaration, inner))
+
     for start, end in parsed.opaque + bodies:
         for match in HIDDEN_DECLARATION.finditer(mask, start, end):
-            declaration = RustFunction(match[1], match.start(), match.start(), match.end() - 1, match.end())
-            inner = []
-            if (start, end) in parsed.opaque:
-                for opening in HIDDEN_MODULE.finditer(mask, start, match.start()):
-                    if match.start() < (close := after_closing(mask, opening.end() - 1)):
-                        boundary = max([start] + [mask.rfind(c, start, opening.start()) for c in ";{}"]) + 1
-                        inner.append(RustFunction(opening[1], boundary, opening.start(), opening.end() - 1, close))
-            if match[1] == module and any(target.is_file() and target.resolve() == path for owner in (True, False)
-                                          for target, _ in module_files(file, owner, parsed, declaration, inner)):
+            if match[1] == module and loads(match.start(), start if (start, end) in parsed.opaque else None):
                 return match.start(), HIDDEN
         for setting in HIDDEN_PATH.finditer(mask, start, end):
             value = string_value(text[setting.end():literals.get(setting.end(), setting.end())])
@@ -991,6 +1087,23 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
         for begin, stop in parsed.source.literals[bisect.bisect_left(starts, start):bisect.bisect_left(starts, end)]:
             if Path(string_value(text[begin:stop]) or "").name == path.name:
                 return start, BUILT
+    regions = [(SCRIPT_HEAD.match(mask).end(), len(mask), None, parsed.opaque + bodies)]
+    for start, end in parsed.opaque:
+        invoked = INVOKED.search(mask, max(0, start - 100), start)
+        if any(body <= start < body_end for body, body_end in bodies):
+            continue
+        if invoked and invoked["name"] not in INCLUDES:
+            regions.append((start + 1, end - 1, start, ()))
+        elif not invoked and DEFINED.search(mask, max(0, start - 100), start):
+            regions += [(begin, stop, start, ()) for _, begin, stop in transcribers(mask, start + 1, end - 1)]
+    for begin, end, region, excluded in regions:
+        for start, opened, close, run in item_attributes(mask, begin, end):
+            strings = [Path(string_value(text[low:high]) or "").name for low, high in parsed.source.literals[bisect.bisect_left(starts, opened):bisect.bisect_left(starts, close)]]
+            if not (re.search(named, mask[opened:close]) or path.name in strings) or any(low <= start < high for low, high in excluded):
+                continue
+            if (arguments := macro_arguments(mask[opened:close - 1], derived(mask, run))) and (
+                    path.name in strings or any(passes_name(found, named) for found in arguments) and loads(start, region)):
+                return start, ATTRIBUTED
     return None
 
 
@@ -1029,7 +1142,8 @@ def declaration_guards(path):
         if hidden := hidden_declaration(file, parsed, path, builders, macros, scope, packages.get(file)):
             offset, kind = hidden
             line = parsed.source.without_comments_or_strings.count("\n", 0, offset) + 1
-            remedy = "if the macro declares no module, keep the module's name out of the invocation or rename the module" if kind == UNREAD else "declare the module outside macros and function bodies"
+            remedies = {UNREAD: "if the macro declares no module, keep the module's name out of the invocation or rename the module", ATTRIBUTED: "if the attribute declares no module, keep the module's name out of its arguments or rename the module"}
+            remedy = remedies.get(kind, "declare the module outside macros and function bodies")
             raise ValueError(f"{file}:{line}: {kind} {path}, and the record cannot read the cfg around it; {remedy}")
     if path not in edges:
         unread = "".join(f"; {message}" for message, _ in broken)
