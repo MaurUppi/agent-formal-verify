@@ -174,10 +174,11 @@ def changed_only_harness(root, commit, models, sources):
     return changed, renames
 
 
-def missed_branch(root, rename, olds):
-    """Whether HEAD has a commit of olds outside rename's history that is not after it, so on a branch merged since."""
+def missed_branch(root, rename, olds, read):
+    """Whether HEAD has a commit of olds not in read, outside rename's history and not after it, so on a branch merged since."""
     commits = git(root, "rev-list", "--full-history", "--no-merges", "HEAD", f"^{rename}", "--", *olds).stdout.split()
-    return any(git(root, "merge-base", "--is-ancestor", rename, commit, check=False).returncode == 1 for commit in commits)
+    return any(commit not in read and git(root, "merge-base", "--is-ancestor", rename, commit, check=False).returncode == 1
+               for commit in commits)
 
 
 class Walk:
@@ -264,7 +265,7 @@ def sync_commit(root, models, shared):
         read = f"the last {FALLBACK_COMMITS} commits of the model files" if unread or queue else "the model files"
         reasons = [f"no commit of {read} changed only the #[cfg(kani)] items of {names}"]
         reasons += [f"it did not follow the rename of {', '.join(olds)} in {rename} into a branch merged after it"
-                    for rename, olds in followed if missed_branch(root, rename, olds)]
+                    for rename, olds in followed if missed_branch(root, rename, olds, {commit for commit, _, _ in done})]
         reasons += [f"it read the parent {parent} of the merge {merge} under {old}, which that parent does not hold, since git finds no rename to {new} against it"
                     for merge, parent, old, new in unseen]
         reasons += [f"it stopped following {path} at the merge {merge}, since none of its parents has {path} and git finds no rename to it"

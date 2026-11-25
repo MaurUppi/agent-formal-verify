@@ -552,9 +552,9 @@ test("sync's fallback follows a rename made in a merge commit into each of its p
 
 // Run git with a committer date one second after the last in this fixture, so git log's order is the order here.
 function clocked(dir) {
-  let second = 0;
+  let second = 1_700_000_000;
   return (...args) => {
-    const stamp = `2026-01-01T00:00:${String(++second).padStart(2, "0")}Z`;
+    const stamp = `@${++second} +0000`;
     const result = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", env: { ...gitEnv, GIT_AUTHOR_DATE: stamp, GIT_COMMITTER_DATE: stamp } });
     if (result.status !== 0) assert.fail(result.stderr);
     return result.stdout.trim();
@@ -714,25 +714,33 @@ test("sync's fallback reads each parent of a merge-made rename under that parent
     assert.equal(later.status, 0, later.stdout + later.stderr);
     assert.equal(lines(later.stdout, "SYNC")[0], `SYNC ${both.harness[order[1]]} from the last commit of the model files that changed no production code in core.rs`);
   }
+
+  // The first parent's walk reads main's commit made after the branch's rename, so SYNC none does not name that rename.
+  const after = fixture();
+  git(after, "init", "-b", "main");
+  commit(after, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + mergeBody }, "production");
+  git(after, "switch", "-c", "side");
+  git(after, "mv", "src/lib.rs", "src/old.rs");
+  git(after, "commit", "-m", "rename on the branch");
+  git(after, "switch", "main");
+  commit(after, { "src/lib.rs": "pub fn claim() -> u8 { 1 }\n" + mergeBody + "pub fn later() -> u8 { 7 }\n" }, "production on main");
+  git(after, "merge", "--no-commit", "--no-ff", "side");
+  git(after, "mv", "src/old.rs", "src/core.rs");
+  git(after, "commit", "-m", "merge and rename");
+  assert.deepEqual([mergeStatus(after, "HEAD^1"), mergeStatus(after, "HEAD^2")], [["R"], ["R"]]);
+  const read = sync(after, ["src/core.rs", "--source", "src/core.rs"]);
+  assert.equal(read.status, 0, read.stdout + read.stderr);
+  assert.equal(read.stdout, "SYNC none: no commit of the model files changed only the #[cfg(kani)] items of core.rs; compare the model with the code in full\n");
 });
 
 test("sync's fallback reads the walks of a merge-made rename together, newest first, and each commit once (#260)", () => {
   // Run git with a committer date one second after the last in this fixture, for histories of more than 59 commits.
-  const ticking = (dir) => {
-    let second = 1_700_000_000;
-    return (...args) => {
-      const stamp = `@${++second} +0000`;
-      const result = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", env: { ...gitEnv, GIT_AUTHOR_DATE: stamp, GIT_COMMITTER_DATE: stamp } });
-      if (result.status !== 0) assert.fail(result.stderr);
-      return result.stdout.trim();
-    };
-  };
   // A history of src/lib.rs on main with count production commits, after a harness commit when withHarness is set, a
   // branch that renames the file to src/old.rs, after a harness commit of its own when withBranchHarness is set, and a
   // merge that renames both to src/core.rs.
   const build = (count, withHarness, withBranchHarness) => {
     const dir = fixture();
-    const at = ticking(dir);
+    const at = clocked(dir);
     const code = (step) => "pub fn claim() -> u8 { 1 }\n" + mergeBody + Array.from({ length: step }, (_, n) => `pub fn extra${n}() -> u8 { ${n} }\n`).join("");
     const write = (text) => writeFileSync(join(dir, "src/lib.rs"), text);
     at("init", "-b", "main");
