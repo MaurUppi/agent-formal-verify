@@ -752,18 +752,25 @@ def item_invocations(mask, start, end, macros, visible):
             i = TOKEN.match(mask, i).end()
 
 
-def readable(invoked, macros, visible):
-    """Return whether an invocation calls one of the macros by a path inside the crate or, without a path, whether
-    every definition of its name that is visible, in textual scope at the invocation, is one of the macros.
+class Macros(NamedTuple):
+    """The `macro_rules!` definitions in the reached files, each map from a macro's name to the (file, offset) keys
+    of its definitions: every definition, and those whose invocations the record can read."""
+    every: dict
+    readable: dict
 
-    macros and visible map a macro's name to the (file, offset) keys of its `macro_rules!` definitions.
+
+def readable(invoked, macros, visible):
+    """Return whether an invocation calls a macro that the record can read: one that a path inside the crate names,
+    or a bare name, and every definition of the name that the invocation may reach is readable.
+
+    A path reaches every definition of the name, and a bare name those in visible, which maps a name to the keys of
+    its definitions in scope at the invocation.
     """
     name = invoked["name"]
     if not LOCAL_PATH.fullmatch(invoked["path"]):
         return False
-    if invoked["path"]:
-        return bool(macros.get(name))
-    return bool(visible.get(name)) and visible[name] <= macros.get(name, set())
+    found = (macros.every if invoked["path"] else visible).get(name)
+    return bool(found) and found <= macros.readable.get(name, set())
 
 
 def macro_definitions(parsed):
@@ -774,36 +781,37 @@ def macro_definitions(parsed):
             yield start, end, defined[1]
 
 
-def block_end(parsed, position):
-    """Return the end of the innermost inline module or function body around position, or infinity at the top of
-    the file."""
-    return min([module.end - 1 for module in parsed.modules if module.start <= position < module.end]
-               + [function.end - 1 for function in parsed.functions if function.body <= position < function.end], default=float("inf"))
-
-
-def readable_macros(parsed_files, builders, scope):
-    """Return the `macro_rules!` definitions in the parsed files whose invocations the record can read, by name:
+def readable_macros(parsed_files, builders):
+    """Return the `macro_rules!` definitions in the parsed files and those whose invocations the record can read:
     those whose transcribers pass no `ident` or `tt` metavariable of their arm to an invocation at an item position
-    of one of the builders or of a macro that the record cannot read. A transcriber sees the macros that scope puts
-    in textual scope at the end of the module or function body around its definition, as an invocation after the
-    definition does."""
-    bodies = [(parsed.source.without_comments_or_strings, start, end, name, (file, start), scope(file, block_end(parsed, start)))
-              for file, parsed in parsed_files for start, end, name in macro_definitions(parsed)]
-    macros = {}
-    for *_, name, key, _ in bodies:
-        macros.setdefault(name, set()).add(key)
-    while forwarding := {(name, key) for mask, start, end, name, key, visible in bodies if key in macros[name] and any(
-            (invocation["name"] in builders or not readable(invocation, macros, visible)) and passes_name(tokens, rf"\$(?:{'|'.join(variables)})\b")
+    of one of the builders or of a macro that the record cannot read. A bare name in a transcriber resolves where
+    the macro is invoked, so it may reach every definition of the name."""
+    bodies = [(parsed.source.without_comments_or_strings, start, end, name, (file, start)) for file, parsed in parsed_files for start, end, name in macro_definitions(parsed)]
+    every = {}
+    for *_, name, key in bodies:
+        every.setdefault(name, set()).add(key)
+    macros = Macros(every, {name: set(keys) for name, keys in every.items()})
+    while forwarding := {(name, key) for mask, start, end, name, key in bodies if key in macros.readable[name] and any(
+            (invocation["name"] in builders or not readable(invocation, macros, every)) and passes_name(tokens, rf"\$(?:{'|'.join(variables)})\b")
             for variables, begin, stop in transcribers(mask, start + 1, end - 1) if variables
-            for invocation, tokens in item_invocations(mask, begin, stop, macros, visible))}:
+            for invocation, tokens in item_invocations(mask, begin, stop, macros, every))}:
         for name, key in forwarding:
-            macros[name].discard(key)
+            macros.readable[name].discard(key)
     return macros
 
 
-def macro_used(source, item):
-    """Return whether a module item carries `#[macro_use]`."""
-    return any(re.sub(r"\s+", "", attribute.without_comments_or_strings) == "macro_use" for attribute in outer_attributes(source, item.start, item.keyword))
+def inner_attributes(source, start):
+    """Yield the contents of each inner attribute at offset start of source."""
+    mask = source.without_comments_or_strings
+    while attribute := INNER_ATTRIBUTE.match(mask, start):
+        opener = attribute.end() - 1
+        start = after_closing(mask, opener)
+        yield rust_masks(source.uncommented[opener + 1:start - 1])
+
+
+def macro_use(attributes):
+    """Return whether one of the attributes is `macro_use`."""
+    return any(re.sub(r"\s+", "", attribute.without_comments_or_strings) == "macro_use" for attribute in attributes)
 
 
 def merged(*scopes):
@@ -815,47 +823,74 @@ def merged(*scopes):
     return union
 
 
-LOCAL_IMPORT = re.compile(r"\buse\s+(?:\$?crate|self|super)\b[^;]*;")
+IMPORT = re.compile(r"\buse\s+(?:::\s*)?(\$?\w+)\b[^;]*;")
+MACRO_EXPORT = re.compile(r"#\s*\[\s*macro_export\b[^\]]*\]\s*(?:#\s*!?\s*\[[^\]]*\]\s*)*macro_rules\s*!\s*\w+\s*$")
 
 
 def textual_scopes(roots, edges):
-    """Return a function of a reached file and an offset in it that gives the `macro_rules!` macros visible there,
-    as a map from each name to the (file, offset) keys of its definitions.
+    """Return a function of a reached file and an offset in it that gives the `macro_rules!` macros a bare name may
+    reach there, as a map from each name to the (file, offset) keys of its definitions.
 
-    Those are the macros in textual scope as rustc scopes them: defined earlier in the file, in scope at each
-    declaration or `include!` that leads to the file from a crate root, if every route has them, or brought in by
-    an earlier `include!` or `#[macro_use]` module declaration. A definition or declaration inside an inline module
-    counts outside the module only when the module carries `#[macro_use]`, and one inside a function body only in
-    that body. A macro that a `use crate::...`, `use self::...` or `use super::...` item in the file names is
-    visible too, through each of its definitions.
+    Those are the macros defined earlier in the file, those in scope at every declaration or `include!` that leads
+    to the file from a crate root, and those that an earlier `include!` or `#[macro_use]` module declaration brings
+    in. A definition or declaration inside an inline module counts outside the module only when the module carries
+    `#[macro_use]` or `#![macro_use]`, and one inside a function body only in that body. A `use` item whose path
+    starts with `crate`, `self`, `super` or a module that the file declares brings in each definition of the names
+    it holds, in the module that holds the item. A `#[macro_export]` macro is visible at the top of a crate root.
     """
-    children, inherited, active, definitions = {}, {}, set(), {}
+    children, inherited, active, definitions, exported, root_scope, known = {}, {}, set(), {}, {}, {}, {}
     for target, routes in edges.items():
         for declarer, declaration in routes:
             children.setdefault(declarer, []).append((declaration, target))
     for file in set(roots) | edges.keys():
         try:
-            for start, _, name in macro_definitions(parse_rust(file)):
-                definitions.setdefault(name, set()).add((file, start))
+            parsed = parse_rust(file)
         except ValueError:
             continue
+        mask = parsed.source.without_comments_or_strings
+        for start, _, name in macro_definitions(parsed):
+            definitions.setdefault(name, set()).add((file, start))
+            if MACRO_EXPORT.search(mask, max(0, start - 300), start):
+                root_scope.setdefault(name, set()).add((file, start))
 
-    def reaches(parsed, position, offset):
-        return all(module.start <= offset < module.end or macro_used(parsed.source, module) for module in parsed.modules if module.start <= position < module.end) and all(
+    def escapes(parsed, module):
+        return macro_use(outer_attributes(parsed.source, module.start, module.keyword)) or macro_use(inner_attributes(parsed.source, module.body + 1))
+
+    def within(parsed, position, offset, *, leaving=True):
+        return all(module.start <= offset < module.end or leaving and escapes(parsed, module) for module in parsed.modules if module.start <= position < module.end) and all(
             function.body <= offset < function.end for function in parsed.functions if function.body <= position < function.end)
+
+    def loads_macros(parsed, declaration, child):
+        if parsed.source.without_comments_or_strings.startswith("include", declaration.keyword) or macro_use(outer_attributes(parsed.source, declaration.start, declaration.keyword)):
+            return True
+        try:
+            return macro_use(inner_attributes(parse_rust(child).source, 0))
+        except ValueError:
+            return False
+
+    def facts(file):
+        if file not in known:
+            parsed = parse_rust(file)
+            mask = parsed.source.without_comments_or_strings
+            modules = {"crate", "$crate", "self", "super"} | {item.name.rsplit("::", 1)[-1].removeprefix("r#") for item in parsed.declarations + parsed.modules}
+            imports = [(use.start(), words) for use in IMPORT.finditer(mask) if use[1] in modules and (words := [word for word in re.findall(r"\w+", use[0]) if word in definitions])]
+            known[file] = parsed, [(start, name) for start, _, name in macro_definitions(parsed)], imports
+        return known[file]
 
     def local(file, offset, seen):
         try:
-            parsed = parse_rust(file)
+            parsed, defined, imports = facts(file)
         except ValueError:
             return {}
-        mask = parsed.source.without_comments_or_strings
-        names = merged(*({name: {(file, start)}} for start, _, name in macro_definitions(parsed) if start < offset and reaches(parsed, start, offset)))
-        names = merged(names, *({word: definitions[word]} for use in LOCAL_IMPORT.finditer(mask) for word in re.findall(r"\w+", use[0]) if word in definitions))
+        names = merged(*({name: {(file, start)}} for start, name in defined if start < offset and within(parsed, start, offset)))
+        names = merged(names, *({word: definitions[word]} for start, words in imports if within(parsed, start, offset, leaving=False) for word in words))
+        if file in roots and not any(module.start <= offset < module.end for module in parsed.modules):
+            names = merged(names, root_scope)
         for declaration, child in children.get(file, ()):
-            if child not in seen and declaration.start < offset and reaches(parsed, declaration.start, offset) and (
-                    mask.startswith("include", declaration.keyword) or macro_used(parsed.source, declaration)):
-                names = merged(names, local(child, float("inf"), seen | {child}))
+            if child not in seen and declaration.start < offset and within(parsed, declaration.start, offset) and loads_macros(parsed, declaration, child):
+                if child not in exported:
+                    exported[child] = local(child, float("inf"), seen | {child})
+                names = merged(names, exported[child])
         return names
 
     def scope(file, offset):
@@ -939,17 +974,18 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
             return start, BUILT
         if any(body <= start < body_end for body, body_end in bodies):
             continue
-        visible = scope(file, start if invoked else block_end(parsed, start))
-        if invoked and not readable(invoked, macros, visible):
-            if passes_name(mask[start + 1:end - 1], identifier):
-                return start, UNREAD
-        else:
-            regions = [(start + 1, end - 1)] if invoked else [(begin, stop) for _, begin, stop in transcribers(mask, start + 1, end - 1)]
-            for nested, tokens in (found for begin, stop in regions for found in item_invocations(mask, begin, stop, macros, visible)):
-                if nested["name"] in builders and re.search(named, tokens):
-                    return nested.start(), BUILT
-                if nested["name"] not in INCLUDES and not readable(nested, macros, visible) and passes_name(tokens, named):
-                    return nested.start(), UNREAD
+        if re.search(identifier, mask[start:end]):
+            visible = scope(file, start) if invoked else macros.every
+            if invoked and not readable(invoked, macros, visible):
+                if passes_name(mask[start + 1:end - 1], identifier):
+                    return start, UNREAD
+            else:
+                regions = [(start + 1, end - 1)] if invoked else [(begin, stop) for _, begin, stop in transcribers(mask, start + 1, end - 1)]
+                for nested, tokens in (found for begin, stop in regions for found in item_invocations(mask, begin, stop, macros, visible)):
+                    if nested["name"] in builders and re.search(named, tokens):
+                        return nested.start(), BUILT
+                    if nested["name"] not in INCLUDES and not readable(nested, macros, visible) and passes_name(tokens, named):
+                        return nested.start(), UNREAD
         if not invoked:
             continue
         for begin, stop in parsed.source.literals[bisect.bisect_left(starts, start):bisect.bisect_left(starts, end)]:
@@ -988,7 +1024,7 @@ def declaration_guards(path):
             continue
     builders = set().union(*(module_builders(parsed) for _, parsed in parsed_files))
     scope = textual_scopes(roots, edges)
-    macros = readable_macros(parsed_files, builders, scope)
+    macros = readable_macros(parsed_files, builders)
     for file, parsed in parsed_files:
         if hidden := hidden_declaration(file, parsed, path, builders, macros, scope, packages.get(file)):
             offset, kind = hidden

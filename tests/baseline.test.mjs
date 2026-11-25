@@ -682,7 +682,15 @@ test("a route to a Kani harness file through include! is followed, and one that 
   assert.equal(guards({ "lib.rs": `mod proofs;\n#[macro_use] mod m { ${local}}\ndeclare!(proofs);\n` }, "proofs.rs"), "");
   assert.equal(guards({ "lib.rs": `mod proofs;\n${local}mod a;\n`, "a.rs": "mod b;\n", "a/b.rs": "declare!(proofs);\n" }, "proofs.rs"), "");
   assert.equal(guards({ "lib.rs": 'mod proofs;\ninclude!("defs.rs");\ndeclare!(proofs);\n', "defs.rs": local }, "proofs.rs"), "");
-  const recursive = "mod proofs;\nmod t {\n    macro_rules! make { ($m:ident) => { struct $m; }; ($m:ident, $n:ident) => { make!($m); make!($n); }; }\n    make!(proofs, other);\n}\n";
+  const exported = "#[macro_export]\nmacro_rules! declare { ($m:ident) => { struct $m; } }\n";
+  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmod a;\n#[macro_export]\nmacro_rules! declare { ($m:ident) => { builders::declare!($m); } }\ncrate::declare!(proofs);\n', "a.rs": local }, "proofs.rs"), /lib\.rs:5: an invocation of a macro that the record cannot read/);
+  const callsite = { "lib.rs": '#[path = "a/proofs.rs"] mod readable;\nmacro_rules! inner { ($m:ident) => { struct $m; } }\nmacro_rules! wrap { ($m:ident) => { inner!($m); } }\nmod a;\n', "a.rs": "macro_rules! inner { ($m:ident) => { builders::declare!($m); } }\nwrap!(proofs);\n" };
+  assert.match(failure(callsite, "a/proofs.rs"), /a\.rs:2: an invocation of a macro that the record cannot read/);
+  assert.equal(guards({ "lib.rs": "macro_rules! wrap { ($m:ident) => { inner!($m); } }\nmod a;\n", "a.rs": `mod proofs;\nmacro_rules! inner { ($m:ident) => { struct $m; } }\nwrap!(proofs);\n` }, "a/proofs.rs"), "");
+  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmod defs;\nmod x { use crate::declare; }\nmod y { use builders::declare; declare!(proofs); }\n', "defs.rs": exported }, "proofs.rs"), /lib\.rs:4: an invocation of a macro that the record cannot read/);
+  assert.equal(guards({ "lib.rs": "mod proofs;\nmod defs;\ndeclare!(proofs);\n", "defs.rs": `#![macro_use]\n${local}` }, "proofs.rs"), "");
+  assert.equal(guards({ "lib.rs": "mod proofs;\nmod defs;\ndeclare!(proofs);\n", "defs.rs": exported }, "proofs.rs"), "");
+  const recursive ="mod proofs;\nmod t {\n    macro_rules! make { ($m:ident) => { struct $m; }; ($m:ident, $n:ident) => { make!($m); make!($n); }; }\n    make!(proofs, other);\n}\n";
   assert.equal(guards({ "lib.rs": recursive }, "proofs.rs"), "");
   assert.equal(guards({ "lib.rs": `mod proofs;\nmod a;\n${local}declare!(proofs);\n`, "a.rs": "macro_rules! declare { ($m:ident) => { builders::declare!($m); } }\n" }, "proofs.rs"), "");
   assert.equal(guards({ "lib.rs": "mod proofs;\n#[macro_use] mod defs;\nmod a;\n", "defs.rs": "#[macro_export]\nmacro_rules! declare { ($m:ident) => { struct $m; } }\n", "a.rs": "use crate::declare;\ndeclare!(proofs);\n" }, "proofs.rs"), "");
