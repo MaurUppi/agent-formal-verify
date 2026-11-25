@@ -1060,6 +1060,11 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
                     included.resolve() == path or names.search(included.read_text(encoding="utf-8", errors="replace"))):
                 return call.start(), INCLUDED
     starts = [begin for begin, _ in parsed.source.literals]
+
+    def names_file(low, high):
+        """Return whether a string literal that starts in mask[low:high] names path's file name."""
+        return any(Path(string_value(text[begin:stop]) or "").name == path.name for begin, stop in parsed.source.literals[bisect.bisect_left(starts, low):bisect.bisect_left(starts, high)])
+
     identifier = rf"\b{re.escape(module)}\b"
     named = rf"(?<![$@]){identifier}"
     for start, end in parsed.opaque:
@@ -1070,7 +1075,7 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
             return start, BUILT
         if any(body <= start < body_end for body, body_end in bodies):
             continue
-        if re.search(identifier, mask[start:end]):
+        if re.search(identifier, mask[start:end]) or names_file(start, end):
             visible = scope(file, start) if invoked else macros.every
             if invoked and not readable(invoked, macros, visible):
                 if passes_name(mask[start + 1:end - 1], identifier):
@@ -1078,15 +1083,12 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
             else:
                 regions = [(start + 1, end - 1)] if invoked else [(begin, stop) for _, begin, stop in transcribers(mask, start + 1, end - 1)]
                 for nested, tokens in (found for begin, stop in regions for found in item_invocations(mask, begin, stop, macros, visible)):
-                    if nested["name"] in builders and re.search(named, tokens):
+                    if nested["name"] in builders and re.search(named, tokens) or nested["name"] not in INCLUDES and names_file(nested.end(), nested.end() + len(tokens)):
                         return nested.start(), BUILT
                     if nested["name"] not in INCLUDES and not readable(nested, macros, visible) and passes_name(tokens, named):
                         return nested.start(), UNREAD
-        if not invoked:
-            continue
-        for begin, stop in parsed.source.literals[bisect.bisect_left(starts, start):bisect.bisect_left(starts, end)]:
-            if Path(string_value(text[begin:stop]) or "").name == path.name:
-                return start, BUILT
+        if invoked and names_file(start, end):
+            return start, BUILT
     regions = [(SCRIPT_HEAD.match(mask).end(), len(mask), None, parsed.opaque + bodies)]
     for start, end in parsed.opaque:
         invoked = INVOKED.search(mask, max(0, start - 100), start)
@@ -1098,11 +1100,11 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
             regions += [(begin, stop, start, ()) for _, begin, stop in transcribers(mask, start + 1, end - 1)]
     for begin, end, region, excluded in regions:
         for start, opened, close, run in item_attributes(mask, begin, end):
-            strings = [Path(string_value(text[low:high]) or "").name for low, high in parsed.source.literals[bisect.bisect_left(starts, opened):bisect.bisect_left(starts, close)]]
-            if not (re.search(named, mask[opened:close]) or path.name in strings) or any(low <= start < high for low, high in excluded):
+            string = names_file(opened, close)
+            if not (string or re.search(named, mask[opened:close])) or any(low <= start < high for low, high in excluded):
                 continue
             if (arguments := macro_arguments(mask[opened:close - 1], derived(mask, run))) and (
-                    path.name in strings or any(passes_name(found, named) for found in arguments) and loads(start, region)):
+                    string or any(passes_name(found, named) for found in arguments) and loads(start, region)):
                 return start, ATTRIBUTED
     return None
 
