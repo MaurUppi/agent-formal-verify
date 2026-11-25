@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { command, fixture, removeFixtures, root } from "./helpers.mjs";
@@ -11,21 +11,25 @@ afterEach(removeFixtures);
 
 const mirror = "https://ftpmirror.gnu.org/bash/bash-3.2.57.tar.gz";
 const origin = "https://ftp.gnu.org/gnu/bash/bash-3.2.57.tar.gz";
+const urls = (calls) => calls.map((call) => call.split(" ").at(-1));
 
-// The Bash 3.2 job's lines that download its tarball and check its checksum.
+const workflow = readFileSync(join(root, ".github/workflows/ci.yml"), "utf8").split("\n");
+const sha256 = workflow.map((line) => line.match(/^\s*BASH_TARBALL_SHA256: ([0-9a-f]{64})$/)?.[1]).find(Boolean);
+
+// The Bash 3.2 job's lines that restore or download its tarball and check its checksum.
 function download() {
-  const workflow = readFileSync(join(root, ".github/workflows/ci.yml"), "utf8").split("\n");
   const step = workflow.findIndex((line) => line.includes("name: Build GNU Bash 3.2.57"));
-  const first = workflow.findIndex((line, i) => i > step && /^\s*fetch\(\) \{/.test(line));
-  const last = workflow.findIndex((line, i) => i > step && /^\s*fetch https:/.test(line));
-  assert.ok(step >= 0 && first > step && last > first, "the Bash 3.2 job has no fetch function and call");
+  const first = workflow.findIndex((line, i) => i > step && /^\s*check\(\) \{/.test(line));
+  const last = workflow.findIndex((line, i) => i > step && /\|\| fetch https:/.test(line));
+  assert.ok(sha256 && step >= 0 && first > step && last > first, "the Bash 3.2 job has no checksum, check and fetch functions or call");
   return workflow.slice(first, last + 1).map((line) => line.trim()).join("\n");
 }
 
 // Run the download with a curl that times out for each unreachable URL and serves other bytes for each junk URL,
-// and a sha256sum that accepts only the bytes curl serves for the other URLs.
-function fetch(unreachable, junk = []) {
+// and a sha256sum that accepts only the bytes curl serves for the other URLs. A cached string is the tarball the cache restored.
+function fetch(unreachable, junk = [], cached) {
   const dir = fixture();
+  if (cached !== undefined) writeFileSync(join(dir, "bash-3.2.57.tar.gz"), cached);
   command(dir, "curl", `printf '%s\\n' "$*" >> "${dir}/curl.log"
 prev=
 for arg; do [ "$prev" = -o ] && out=$arg; prev=$arg; done
@@ -35,7 +39,7 @@ printf tarball > "$out"`);
   command(dir, "sha256sum", `read -r line
 printf '%s\\n' "$line" >> "${dir}/sha256sum.log"
 [ "$(cat "\${line##* }")" = tarball ]`);
-  const result = spawnSync("bash", ["-e", "-c", download()], { cwd: dir, encoding: "utf8", env: { ...process.env, PATH: `${join(dir, "bin")}:${process.env.PATH}` } });
+  const result = spawnSync("bash", ["-e", "-c", download()], { cwd: dir, encoding: "utf8", env: { ...process.env, BASH_TARBALL_SHA256: sha256, PATH: `${join(dir, "bin")}:${process.env.PATH}` } });
   const log = (name) => {
     try {
       return readFileSync(join(dir, name), "utf8").split("\n").filter(Boolean);
@@ -47,7 +51,6 @@ printf '%s\\n' "$line" >> "${dir}/sha256sum.log"
 }
 
 test("the Bash 3.2 job falls back to ftp.gnu.org when ftpmirror.gnu.org is unreachable or serves other bytes, and checks the tarball", () => {
-  const urls = (calls) => calls.map((call) => call.split(" ").at(-1));
   const checksum = /^[0-9a-f]{64} {2}bash-3\.2\.57\.tar\.gz$/;
   const fallback = fetch([mirror]);
   assert.equal(fallback.status, 0, fallback.stderr);
@@ -65,4 +68,15 @@ test("the Bash 3.2 job falls back to ftp.gnu.org when ftpmirror.gnu.org is unrea
   const neither = fetch([mirror, origin]);
   assert.notEqual(neither.status, 0);
   assert.deepEqual(urls(neither.calls), [mirror, origin]);
+});
+
+test("the Bash 3.2 job uses a checked tarball the cache restored without reaching gnu.org, and downloads one when the cached bytes differ", () => {
+  const restored = fetch([mirror, origin], [], "tarball");
+  assert.equal(restored.status, 0, restored.stderr);
+  assert.deepEqual(restored.calls, []);
+  assert.deepEqual(restored.checked, [`${sha256}  bash-3.2.57.tar.gz`]);
+  const stale = fetch([], [], "junk");
+  assert.equal(stale.status, 0, stale.stderr);
+  assert.deepEqual(urls(stale.calls), [mirror]);
+  assert.equal(stale.checked.length, 2);
 });
