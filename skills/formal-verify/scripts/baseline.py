@@ -824,7 +824,7 @@ def merged(*scopes):
 
 
 IMPORT = re.compile(r"\buse\s+(?:::\s*)?(\$?\w+)\b[^;]*;")
-MACRO_EXPORT = re.compile(r"#\s*\[\s*macro_export\b[^\]]*\]\s*(?:#\s*!?\s*\[[^\]]*\]\s*)*macro_rules\s*!\s*\w+\s*$")
+MACRO_EXPORT = re.compile(r"#\s*\[\s*macro_export\b[^\]]*\]\s*(?:#\s*(?:!\s*)?\[[^\]]*\]\s*)*macro_rules\s*!\s*\w+\s*$")
 
 
 def textual_scopes(roots, edges):
