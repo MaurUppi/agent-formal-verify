@@ -711,6 +711,8 @@ test("a route to a Kani harness file through include! is followed, and one that 
   assert.equal(guards({ "lib.rs": derived }, "proofs.rs"), "");
   assert.equal(guards({ "lib.rs": "mod proofs;\nstruct Tuple(#[builders::declare(proofs)] u8, #[into(proofs)] u16);\n" }, "proofs.rs"), "");
   assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\n#[derive(Clone)]\n#[builders::declare(proofs)]\nstruct S;\n' }, "proofs.rs"), /lib\.rs:3: an attribute macro that the record cannot read/);
+  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! wrap { () => { builders::declare_at!(x, "proofs.rs"); }; }\nwrap!();\n' }, "proofs.rs"), /lib\.rs:2: a macro invocation may build a module declaration that loads .*proofs\.rs/);
+  assert.equal(guards({ "lib.rs": 'mod proofs;\nmacro_rules! wrap { () => { builders::declare_at!(x, "other.rs"); const NAME: &str = "proofs.rs"; }; }\nwrap!();\n' }, "proofs.rs"), "");
   const recursive = "mod proofs;\nmod t {\n    macro_rules! make { ($m:ident) => { struct $m; }; ($m:ident, $n:ident) => { make!($m); make!($n); }; }\n    make!(proofs, other);\n}\n";
   assert.equal(guards({ "lib.rs": recursive }, "proofs.rs"), "");
   assert.equal(guards({ "lib.rs": `mod proofs;\nmod a;\n${local}declare!(proofs);\n`, "a.rs": "macro_rules! declare { ($m:ident) => { builders::declare!($m); } }\n" }, "proofs.rs"), "");
