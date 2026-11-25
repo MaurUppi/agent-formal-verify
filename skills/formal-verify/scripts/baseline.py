@@ -772,9 +772,11 @@ def item_invocations(mask, start, end, macros, visible):
 
 class Macros(NamedTuple):
     """The `macro_rules!` definitions in the reached files, each map from a macro's name to the (file, offset) keys
-    of its definitions: every definition, and those whose invocations the record can read."""
+    of its definitions: every definition, and those whose invocations the record can read, with the keys of the
+    callbacks, those whose transcribers invoke a macro through a metavariable, such as `$mac!(...)`."""
     every: dict
     readable: dict
+    callbacks: set
 
 
 def readable(invoked, macros, visible):
@@ -808,7 +810,8 @@ def readable_macros(parsed_files, builders):
     every = {}
     for *_, name, key in bodies:
         every.setdefault(name, set()).add(key)
-    macros = Macros(every, {name: set(keys) for name, keys in every.items()})
+    callbacks = {key for mask, start, end, _, key in bodies if any(CALLBACK.search(mask, begin, stop) for _, begin, stop in transcribers(mask, start + 1, end - 1))}
+    macros = Macros(every, {name: set(keys) for name, keys in every.items()}, callbacks)
 
     def forwards(mask, begin, stop, variables):
         passed = rf"\$(?:{'|'.join(variables)})\b"
@@ -847,6 +850,10 @@ def merged(*scopes):
 
 
 IMPORT = re.compile(r"\buse\s+(?:::\s*)?(\$?\w+)\b[^;]*;")
+CALLBACK = re.compile(r"\$\w+\s*!\s*[(\[{]")
+CALLEE = re.compile(r"(?<![\w$])(?:\$(?=crate\b))?(?P<path>(?:::\s*)?(?:\w+\s*::\s*)*)(?P<name>\w+)")
+LOCAL_TYPE = re.compile(r"\b(?:enum|struct|union|trait|type)\s+(?:r#)?(\w+)")
+USE_LEAF = re.compile(r"\b(?!(?:self|super|crate|as)\b)(\w+)\b(?!\s*::)")
 MACRO_EXPORT = re.compile(r"#\s*\[\s*macro_export\b[^\]]*\]\s*(?:#\s*(?:!\s*)?\[[^\]]*\]\s*)*macro_rules\s*!\s*\w+\s*$")
 
 
@@ -928,6 +935,21 @@ def textual_scopes(roots, edges):
         return merged(inherited[file], local(file, offset, {file}))
 
     return scope
+
+
+def top_level(tokens):
+    """Return the tokens inside a macro invocation's delimiters with each group and attribute in them blanked."""
+    blanked, i = list(tokens), 0
+    while i < len(tokens):
+        attribute = ATTRIBUTE.match(tokens, i)
+        if attribute or tokens[i] in "([{":
+            close = after_closing(tokens, attribute.end() - 1 if attribute else i)
+            low, high = (i, close) if attribute else (i + 1, close - 1)
+            blanked[low:high] = " " * (high - low)
+            i = close
+        else:
+            i += 1
+    return "".join(blanked)
 
 
 def passes_name(tokens, name):
@@ -1021,7 +1043,8 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
     stand for, a macro invocation outside function bodies that holds a string
     naming path's file name, and an invocation of one of the builders macros that names path's module. So is an
     invocation outside function bodies of a macro that is not one of the readable macros, or that a path outside the
-    crate names, when it may pass path's module on as the name of a module it declares. The invocations at item
+    crate names, when it may pass path's module on as the name of a module it declares. So is an invocation of a
+    callback macro, whose transcriber invokes `$mac!`, whose tokens name such a macro. The invocations at item
     positions in a `macro_rules!` transcriber or a readable macro's invocation count too.
     """
     module = path.parent.name if path.name == "mod.rs" else path.stem
@@ -1060,6 +1083,25 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
                     included.resolve() == path or names.search(included.read_text(encoding="utf-8", errors="replace"))):
                 return call.start(), INCLUDED
     starts = [begin for begin, _ in parsed.source.literals]
+    local_roots = {"crate", "self", "super", "Self"} | {item.name.rsplit("::", 1)[-1].removeprefix("r#") for item in parsed.declarations + parsed.modules} | set(LOCAL_TYPE.findall(mask))
+    imported = {leaf for use in IMPORT.finditer(mask) if use[1] not in local_roots | {"$crate"} and not any(body <= use.start() < body_end for body, body_end in bodies)
+                for leaf in USE_LEAF.findall(use[0], 3)}
+
+    def unread_callee(callee, visible):
+        """Return whether a path or a name in a callback invocation's tokens may call a macro that the record cannot
+        read: through a path outside the crate, by a name that a `use` item imports from another crate, or as a local
+        macro that the record cannot read or whose body declares `mod $<name>;`."""
+        head = re.match(r"\s*(::|\w+)", callee["path"])
+        if head and head[1] not in local_roots or not head and callee["name"] in imported:
+            return True
+        found = (macros.every if head else visible).get(callee["name"], set())
+        return bool(found) and (callee["name"] in builders or not found <= macros.readable.get(callee["name"], set()))
+
+    def calls_back(invoked, tokens, visible):
+        """Return whether an invocation of a callback names, outside the groups and attributes in its tokens, a macro
+        that the record cannot read."""
+        found = (macros.every if invoked["path"] else visible).get(invoked["name"], set())
+        return bool(found & macros.callbacks) and any(unread_callee(callee, visible) for callee in CALLEE.finditer(top_level(tokens)))
 
     def names_file(low, high):
         """Return whether a string literal that starts in mask[low:high] names path's file name."""
@@ -1077,7 +1119,7 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
             continue
         if re.search(identifier, mask[start:end]) or names_file(start, end):
             visible = scope(file, start) if invoked else macros.every
-            if invoked and not readable(invoked, macros, visible):
+            if invoked and (not readable(invoked, macros, visible) or calls_back(invoked, mask[start + 1:end - 1], visible)):
                 if passes_name(mask[start + 1:end - 1], identifier):
                     return start, UNREAD
             else:
@@ -1085,7 +1127,7 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
                 for nested, tokens in (found for begin, stop in regions for found in item_invocations(mask, begin, stop, macros, visible)):
                     if nested["name"] in builders and re.search(named, tokens) or nested["name"] not in INCLUDES and names_file(nested.end(), nested.end() + len(tokens)):
                         return nested.start(), BUILT
-                    if nested["name"] not in INCLUDES and not readable(nested, macros, visible) and passes_name(tokens, named):
+                    if nested["name"] not in INCLUDES and (not readable(nested, macros, visible) or invoked and calls_back(nested, tokens, visible)) and passes_name(tokens, named):
                         return nested.start(), UNREAD
         if invoked and names_file(start, end):
             return start, BUILT

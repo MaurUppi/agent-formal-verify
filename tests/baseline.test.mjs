@@ -674,6 +674,20 @@ test("a route to a Kani harness file through include! is followed, and one that 
   assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! wrap { (fn $m:ident) => { builders::declare!($m); }; }\nwrap!(fn proofs);\n' }, "proofs.rs"), forwarded);
   const callback = "mod proofs;\nmacro_rules! strip { ($mac:ident!($($t:tt)*)) => { $mac!([] $($t)*); }; }\nmacro_rules! shape {\n    ([] struct $name:ident { $($f:tt)* }) => { struct $name { $($f)* } };\n    ($($t:tt)*) => { strip!(shape!($($t)*)); };\n}\nshape! { struct S { proofs: u8 } }\n";
   assert.equal(guards({ "lib.rs": callback }, "proofs.rs"), "");
+  const caller = /lib\.rs:3: an invocation of a macro that the record cannot read may build a module declaration that loads .*proofs\.rs/;
+  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! call { ($mac:path, $m:ident) => { $mac!($m); }; }\ncall!(builders::declare, proofs);\n' }, "proofs.rs"), caller);
+  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! call { ($mac:ident, $m:ident) => { $mac!($m); }; }\ncall!(declare, proofs);\nuse builders::declare;\n' }, "proofs.rs"), caller);
+  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! call { ($mac:path, $m:ident) => { $mac!($m); }; }\ncall!(::builders::declare, proofs);\n' }, "proofs.rs"), caller);
+  for (const callee of ["macro_rules! wrap { ($m:ident) => { builders::declare!($m); }; }\n", "macro_rules! wrap { ($m:ident) => { mod $m; }; }\n"]) {
+    assert.match(failure({ "lib.rs": `#[path = "proofs.rs"] mod readable;\nmacro_rules! call { ($mac:ident, $m:ident) => { $mac!($m); }; }\n${callee}call!(wrap, proofs);\n` }, "proofs.rs"), /lib\.rs:4: an invocation of a macro that the record cannot read/);
+  }
+  const shared = "mod proofs;\nmacro_rules! shared_api { ($mac:ident) => { $mac! { struct Program { proofs: u8 } } }; }\nmacro_rules! encode { ($($t:tt)*) => { $($t)* } }\nshared_api!(encode);\n#[macro_export]\nmacro_rules! constant { ($m:ident) => { const $m: u8 = 0; } }\nmacro_rules! call { ($mac:path, $m:ident) => { $mac!($m); }; }\ncall!(crate::constant, proofs);\n";
+  assert.equal(guards({ "lib.rs": shared }, "proofs.rs"), "");
+  const apply = "mod proofs;\nmacro_rules! apply { ($mac:ident { $($t:tt)* }) => { $mac! { $($t)* } }; }\nmacro_rules! encode { ($($t:tt)*) => { $($t)* } }\n";
+  for (const tokens of ["struct S { proofs: std::vec::Vec<u8> }", "const proofs: u32 = u32::MAX;", "#[derive(serde::Serialize)] struct S { proofs: u8 }", "struct S { proofs: u8 } impl S { fn f(&self) -> usize { core::mem::size_of::<Self>() } }"]) {
+    assert.equal(guards({ "lib.rs": `${apply}apply!(encode { ${tokens} });\n` }, "proofs.rs"), "", tokens);
+  }
+  assert.equal(guards({ "lib.rs": `${apply}use std::io::{self, Read};\nfn unrelated() { use std::fmt::Write; }\napply!(encode { struct S { proofs: u8 } trait Write {} impl S { fn f(&self) {} } });\n` }, "proofs.rs"), "");
   const local = "macro_rules! declare { ($m:ident) => { struct $m; } }\n";
   assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmod other;\nuse builders::declare;\ndeclare!(proofs);\n', "other.rs": local }, "proofs.rs"), /lib\.rs:4: an invocation of a macro that the record cannot read/);
   assert.match(failure({ "lib.rs": `#[path = "proofs.rs"] mod readable;\nmod m { ${local}}\nuse builders::declare;\ndeclare!(proofs);\n` }, "proofs.rs"), /lib\.rs:5: an invocation of a macro that the record cannot read/);
