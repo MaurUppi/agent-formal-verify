@@ -772,9 +772,11 @@ def item_invocations(mask, start, end, macros, visible):
 
 class Macros(NamedTuple):
     """The `macro_rules!` definitions in the reached files, each map from a macro's name to the (file, offset) keys
-    of its definitions: every definition, and those whose invocations the record can read."""
+    of its definitions: every definition, and those whose invocations the record can read, with the keys of the
+    callbacks, those whose transcribers invoke a macro through a metavariable, such as `$mac!(...)`."""
     every: dict
     readable: dict
+    callbacks: set
 
 
 def readable(invoked, macros, visible):
@@ -808,7 +810,8 @@ def readable_macros(parsed_files, builders):
     every = {}
     for *_, name, key in bodies:
         every.setdefault(name, set()).add(key)
-    macros = Macros(every, {name: set(keys) for name, keys in every.items()})
+    callbacks = {key for mask, start, end, _, key in bodies if any(CALLBACK.search(mask, begin, stop) for _, begin, stop in transcribers(mask, start + 1, end - 1))}
+    macros = Macros(every, {name: set(keys) for name, keys in every.items()}, callbacks)
 
     def forwards(mask, begin, stop, variables):
         passed = rf"\$(?:{'|'.join(variables)})\b"
@@ -847,6 +850,8 @@ def merged(*scopes):
 
 
 IMPORT = re.compile(r"\buse\s+(?:::\s*)?(\$?\w+)\b[^;]*;")
+CALLBACK = re.compile(r"\$(?!crate\b)\w+\s*!\s*[(\[{]")
+PATH_HEAD = re.compile(r"(?<![\w$:])(\w+)\s*::\s*\w")
 MACRO_EXPORT = re.compile(r"#\s*\[\s*macro_export\b[^\]]*\]\s*(?:#\s*(?:!\s*)?\[[^\]]*\]\s*)*macro_rules\s*!\s*\w+\s*$")
 
 
@@ -1060,6 +1065,14 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
                     included.resolve() == path or names.search(included.read_text(encoding="utf-8", errors="replace"))):
                 return call.start(), INCLUDED
     starts = [begin for begin, _ in parsed.source.literals]
+    local_roots = {"crate", "self", "super"} | {item.name.rsplit("::", 1)[-1].removeprefix("r#") for item in parsed.declarations + parsed.modules}
+    imported = {word for use in IMPORT.finditer(mask) if use[1] not in local_roots | {"$crate"} for word in re.findall(r"\w+", use[0])[1:]}
+
+    def calls_back(invoked, tokens, visible):
+        """Return whether an invocation of a callback names in its tokens a macro that the record cannot read, by a path
+        outside the crate or by a name that a `use` item imports from another crate."""
+        found = (macros.every if invoked["path"] else visible).get(invoked["name"], set())
+        return bool(found & macros.callbacks) and (any(head[1] not in local_roots for head in PATH_HEAD.finditer(tokens)) or not imported.isdisjoint(re.findall(r"\w+", tokens)))
 
     def names_file(low, high):
         """Return whether a string literal that starts in mask[low:high] names path's file name."""
@@ -1077,7 +1090,7 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
             continue
         if re.search(identifier, mask[start:end]) or names_file(start, end):
             visible = scope(file, start) if invoked else macros.every
-            if invoked and not readable(invoked, macros, visible):
+            if invoked and not (readable(invoked, macros, visible) and not calls_back(invoked, mask[start + 1:end - 1], visible)):
                 if passes_name(mask[start + 1:end - 1], identifier):
                     return start, UNREAD
             else:
@@ -1085,7 +1098,7 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
                 for nested, tokens in (found for begin, stop in regions for found in item_invocations(mask, begin, stop, macros, visible)):
                     if nested["name"] in builders and re.search(named, tokens) or nested["name"] not in INCLUDES and names_file(nested.end(), nested.end() + len(tokens)):
                         return nested.start(), BUILT
-                    if nested["name"] not in INCLUDES and not readable(nested, macros, visible) and passes_name(tokens, named):
+                    if nested["name"] not in INCLUDES and not (readable(nested, macros, visible) and not (invoked and calls_back(nested, tokens, visible))) and passes_name(tokens, named):
                         return nested.start(), UNREAD
         if invoked and names_file(start, end):
             return start, BUILT
