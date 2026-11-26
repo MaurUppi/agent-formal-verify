@@ -12,14 +12,14 @@ function python(input, expression) {
     "import json, sys",
     `sys.path.insert(0, ${JSON.stringify(scripts)})`,
     "import rust_source",
-    `input = json.loads(${JSON.stringify(JSON.stringify(input))})`,
+    "input = json.loads(sys.argv[1])",
     "try:",
     `    value = ${expression}`,
     "except ValueError as error:",
     "    value = {'error': str(error)}",
     "print(json.dumps(value))",
   ].join("\n");
-  const result = spawnSync("python3", ["-B", "-c", script], { encoding: "utf8" });
+  const result = spawnSync("python3", ["-B", "-c", script, JSON.stringify(input)], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
 }
