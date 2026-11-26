@@ -790,7 +790,7 @@ def compiled_problems(path, surface, reader, recorded=None):
 
 
 class LeanKind:
-    """Record, compare and move the declarations of a Lean statements file."""
+    """Record, compare and move the toolchain and declarations of a Lean statements file."""
 
     name, suffix, renames = "lean", ".statements", False
 
@@ -832,7 +832,7 @@ class TlaKind:
 
 
 class KaniKind:
-    """Record, compare and move the harnesses of a Kani file, checked against what Kani compiles."""
+    """Record, compare and move the harnesses, assumptions, covers and stubs of a Kani file, checked against what Kani compiles."""
 
     name, suffix, renames = "kani", ".rs", True
 
