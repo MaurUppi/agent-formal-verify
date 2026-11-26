@@ -164,8 +164,8 @@ macro_rules! declare { ($m:ident) => { mod $m; }; }
 macro_rules! declare_at { ($m:ident, $p:literal) => { #[path = $p] mod $m; }; }
 """
 CALL_PATH = "macro_rules! call { ($mac:path, $m:ident) => { $mac!($m); }; }\n"
-# Each crate compiles src/<harness> a second time through a macro from the builders crate, as the open baseline.py
-# macro issues show, beside a #[path] route that the record reads. Kani names the harness on the second route.
+# Each crate compiles src/<harness> a second time through a macro from the builders crate, as #266, #271 and #273 to
+# #275 show, beside a #[path] route that the record reads. Kani names the harness on the second route.
 HIDDEN_ROUTES = [
     ("a::proofs::check", "a/proofs.rs", {
         "lib.rs": '#[path = "a/proofs.rs"] mod readable;\nmod other;\nmod a;\npub use builders::declare;\n',
