@@ -816,13 +816,13 @@ class TlaKind:
         return model_entry(self.name, tla_surface(path)), None
 
     def changes(self, entry, path):
-        old, lines = entry["surface"], differences(entry["surface"], tla_surface(path), ())
-        notes = []
+        old, new = entry["surface"], tla_surface(path)
+        lines = []
         if not any(name.startswith("imports ") for name in old):
-            notes.append("  previous baseline did not track imported modules; review and record this matrix again")
+            lines.append("  previous baseline did not track imported modules; review and record this matrix again")
         if "TLA+ layout version" not in old:
-            notes.append("  previous baseline did not preserve TLA+ layout; review and record this matrix again")
-        return notes + lines
+            lines.append("  previous baseline did not preserve TLA+ layout; review and record this matrix again")
+        return lines + differences(old, new, ())
 
     def valid(self, entry):
         return True
@@ -877,8 +877,9 @@ class KaniKind:
             compiled = compiled and list(renamed(dict.fromkeys(compiled), *module))
         surface = joined(surface, new, existing)
         if existing is not None:
-            # The merged entry holds Kani's list only when both entries were checked against Kani at record.
-            compiled = [*existing["compiled"], *compiled] if "compiled" in existing and compiled is not None else None
+            # The merged entry holds Kani's list only when both are Kani entries checked against Kani at record.
+            checked = existing["kind"] == self.name and "compiled" in existing
+            compiled = [*existing["compiled"], *compiled] if checked and compiled is not None else None
         result = model_entry(self.name, surface)
         if compiled is not None:
             result["compiled"] = sorted(compiled)
