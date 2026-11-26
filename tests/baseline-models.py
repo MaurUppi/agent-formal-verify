@@ -164,8 +164,8 @@ macro_rules! declare { ($m:ident) => { mod $m; }; }
 macro_rules! declare_at { ($m:ident, $p:literal) => { #[path = $p] mod $m; }; }
 """
 CALL_PATH = "macro_rules! call { ($mac:path, $m:ident) => { $mac!($m); }; }\n"
-# Each crate compiles src/<harness> a second time through a macro from the builders crate, as the open baseline.py
-# macro issues show, beside a #[path] route that the record reads. Kani names the harness on the second route.
+# Each crate compiles src/<harness> a second time through a macro from the builders crate, as #266, #271 and #273 to
+# #275 show, beside a #[path] route that the record reads. Kani names the harness on the second route.
 HIDDEN_ROUTES = [
     ("a::proofs::check", "a/proofs.rs", {
         "lib.rs": '#[path = "a/proofs.rs"] mod readable;\nmod other;\nmod a;\npub use builders::declare;\n',
@@ -199,6 +199,31 @@ HIDDEN_ROUTES = [
     ("proofs::check", "proofs.rs", {
         "lib.rs": '#[path = "proofs.rs"] mod readable;\n'
                   "macro_rules! call { ($mac:ident, $m:ident) => { builders::$mac!($m); }; }\ncall!(declare, proofs);\n"}),
+    # A route under a function body or a const _ block, which the record does not read, keeps its own name.
+    ("f::m::again::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\nfn f() {\n    mod m {\n        #[path = "../proofs.rs"]\n        mod again;\n    }\n}\n',
+        # rustc resolves src/m/../proofs.rs only when src/m exists.
+        "m/.keep": ""}),
+    ("f::m::again::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\nfn f() {\n    mod m { include!("sub/items.rs"); }\n}\n',
+        "sub/items.rs": '#[path = "../proofs.rs"]\nmod again;\n'}),
+    ("_::readable::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\nconst _: () = {\n    #[path = "proofs.rs"]\n    mod readable;\n};\n'}),
+    ("_::x::check", "proofs.rs", {
+        "lib.rs": 'include!("proofs.rs");\nconst _: () = {\n    #[path = "proofs.rs"]\n    mod x;\n};\n'}),
+]
+# Each crate invokes a macro that rustc resolves to a local one that declares no module, through a glob import, a
+# module path, and a definition that shadows one passing the name to the builders crate. Each records.
+READABLE_ROUTES = [
+    ("a/proofs.rs", {
+        "lib.rs": "mod a;\nmacro_rules! declare { ($m:ident) => { fn $m() {} } }\npub(crate) use declare;\n",
+        "a.rs": "mod proofs;\nuse super::*;\ndeclare!(proofs);\n"}),
+    ("proofs.rs", {
+        "lib.rs": "mod proofs;\nmod a;\na::declare!(proofs);\n",
+        "a.rs": "macro_rules! declare { ($m:ident) => { fn $m() {} } }\npub(crate) use declare;\n"}),
+    ("proofs.rs", {
+        "lib.rs": "mod proofs;\n#[allow(unused_macros)]\nmacro_rules! declare { ($m:ident) => { builders::declare!($m); } }\n"
+                  "macro_rules! declare { ($m:ident) => { fn $m() {} } }\ndeclare!(proofs);\n"}),
 ]
 HARNESS = "#[kani::proof]\n#[kani::unwind(1)]\nfn check() {\n    assert!(1 + 1 == 2);\n}\n"
 
@@ -220,6 +245,10 @@ def kani_routes(work):
         write_crate(crate, {**files, harness: HARNESS}, '[dependencies]\nbuilders = { path = "../builders" }\n\n')
         refused = run(1, "baseline.py", "record", work / f"routes-{number}.json", crate / "src" / harness)
         assert f"Kani compiles {name} from this file, but no route that the record reads gives that name" in refused, refused
+    for number, (harness, files) in enumerate(READABLE_ROUTES):
+        crate = work / f"readable-{number}"
+        write_crate(crate, {**files, harness: HARNESS}, '[dependencies]\nbuilders = { path = "../builders" }\n\n')
+        run(0, "baseline.py", "record", work / f"readable-{number}.json", crate / "src" / harness)
     switched = work / "switched"
     write_crate(switched, {"lib.rs": '#[cfg(feature = "proofs")]\nmod proofs;\n', "proofs.rs": HARNESS})
     manifest = switched / "Cargo.toml"
