@@ -628,7 +628,9 @@ def validate_report_path(raw: str) -> Path | None:
     trimmed = raw.strip()
     if not trimmed:
         return None
-    if trimmed.endswith(("/", os.sep)) or (os.altsep and trimmed.endswith(os.altsep)):
+    seps = tuple(dict.fromkeys(s for s in ("/", os.sep, os.altsep) if s))
+    dot_suffixes = tuple(f"{sep}." for sep in seps) + tuple(f"{sep}.." for sep in seps)
+    if trimmed in (".", "..") or trimmed.endswith(seps + dot_suffixes):
         raise ValueError(f"TLC_HTML_REPORT {trimmed} is a directory")
     path = Path(trimmed)
     try:

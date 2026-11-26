@@ -83,7 +83,7 @@ def _parse_standard(lines) -> Trace | None:
         if m := STATE.match(line):
             if current is not None:
                 steps.append(_build_step(current[0], current[1], current[2], prev))
-                prev = current[2]
+                prev = current[2] or prev
             current, var = (int(m[1]), LOCATION.sub("", m[2]), {}), None
         elif m := LASSO.match(line):
             if current is not None:
@@ -98,7 +98,11 @@ def _parse_standard(lines) -> Trace | None:
             current[2][var] += "\n" + line
         elif current is not None:
             steps.append(_build_step(current[0], current[1], current[2], prev))
-            prev, current, var = current[2], None, None
+            prev, current, var = current[2] or prev, None, None
+            if line.strip():
+                break
+        elif steps and line.strip():
+            break
     if current is not None:
         steps.append(_build_step(current[0], current[1], current[2], prev))
     return Trace(tuple(steps), lasso) if steps else None

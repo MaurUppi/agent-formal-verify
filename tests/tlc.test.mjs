@@ -276,6 +276,72 @@ test("tlc_trace.parse parses single-variable initial-state violation with CRLF e
   });
 });
 
+test("tlc_trace.parse stops at post-trace text without appending trailing states or lassos", () => {
+  const afterBlank = parseTraceText([
+    "Error: Invariant Inv is violated.",
+    "Error: The behavior up to this point is:",
+    "State 1: <Init>",
+    "/\\ x = 0",
+    "",
+    "State 2: <Step>",
+    "/\\ x = 1",
+    "",
+    "2 states generated, 2 distinct states found, 0 states left on queue.",
+    "Error: The following behavior constitutes a counter-example:",
+    "State 3: <Bogus>",
+    "/\\ x = 99",
+    "Back to state 1: <BogusLoop>",
+  ].join("\n"));
+  assert.equal(afterBlank.steps.length, 2);
+  assert.equal(afterBlank.lasso, null);
+
+  const direct = parseTraceText([
+    "Error: Invariant Inv is violated.",
+    "Error: The behavior up to this point is:",
+    "State 1: <Init>",
+    "/\\ x = 0",
+    "2 states generated, 1 distinct states found.",
+    "State 2: <Bogus>",
+    "/\\ x = 99",
+  ].join("\n"));
+  assert.equal(direct.steps.length, 1);
+  assert.equal(direct.lasso, null);
+});
+
+test("tlc_trace.parse preserves previous variable values across an empty state", () => {
+  const withBlank = parseTraceText([
+    "Error: Temporal properties were violated.",
+    "Error: The following behavior constitutes a counter-example:",
+    "State 1: <Init>",
+    "/\\ x = 0",
+    "/\\ y = 1",
+    "",
+    "State 2: <Stuttering>",
+    "",
+    "State 3: <Step>",
+    "/\\ x = 2",
+    "/\\ y = 1",
+  ].join("\n"));
+  assert.equal(withBlank.steps.length, 3);
+  assert.deepEqual(withBlank.steps[1].values, []);
+  assert.deepEqual(withBlank.steps[1].changed, []);
+  assert.deepEqual(withBlank.steps[2].changed, [{ name: "x", old: "0", new: "2" }]);
+
+  const adjacent = parseTraceText([
+    "Error: Temporal properties were violated.",
+    "Error: The following behavior constitutes a counter-example:",
+    "State 1: <Init>",
+    "/\\ x = 0",
+    "/\\ y = 1",
+    "State 2: <Stuttering>",
+    "State 3: <Step>",
+    "/\\ x = 2",
+    "/\\ y = 1",
+  ].join("\n"));
+  assert.equal(adjacent.steps.length, 3);
+  assert.deepEqual(adjacent.steps[2].changed, [{ name: "x", old: "0", new: "2" }]);
+});
+
 function matrixFixture(lines, java, log = "tlc-invariant.log") {
   const dir = fixture();
   for (const sub of ["a", "b"]) mkdirSync(join(dir, sub));

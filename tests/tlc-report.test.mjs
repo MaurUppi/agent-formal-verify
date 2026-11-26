@@ -194,6 +194,49 @@ test("tlc_report.render_svg renders clickable state chain, arrow markers, lasso 
   includes(xss.stdout, "unchanged");
 });
 
+test("tlc_report.to_mermaid and render_svg handle duplicate state numbers without collisions and neutralize %%", () => {
+  const script = [
+    "import sys",
+    `sys.path.insert(0, ${JSON.stringify(scripts)})`,
+    "import tlc_report, tlc_trace",
+    "s1 = tlc_trace.Step(1, 'Init %% start', (('x', '0 %% zero'),), (tlc_trace.VarDiff('x', None, '0 %% zero'),))",
+    "s2 = tlc_trace.Step(1, 'Dup %% mid', (('x', '1'),), (tlc_trace.VarDiff('x', '0 %% zero', '1'),))",
+    "s3 = tlc_trace.Step(2, 'Next %% end', (('x', '2'),), (tlc_trace.VarDiff('x', '1', '2'),))",
+    "trace = tlc_trace.Trace((s1, s2, s3), tlc_trace.Lasso(1, 'Loop %% back'))",
+    "print('===MERMAID===')",
+    "print(tlc_report.to_mermaid(trace), end='')",
+    "print('===SVG===')",
+    "print(tlc_report.render_svg(trace, trace_id='dup', kind='fail'), end='')",
+  ].join("\n");
+  const result = runPython(script);
+  assert.equal(result.status, 0, result.stderr);
+  const [, mermaidPart, svgPart] = result.stdout.split(/===(?:MERMAID|SVG)===\n/);
+
+  assert.equal((mermaidPart.match(/ as S1\b/g) || []).length, 1);
+  includes(mermaidPart, 'state "State 1: Init % % start | x=0 % % zero" as S1');
+  includes(mermaidPart, 'state "State 1: Dup % % mid | x=1" as S2');
+  includes(mermaidPart, 'state "State 2: Next % % end | x=2" as S3');
+  includes(mermaidPart, "[*] --> S1");
+  includes(mermaidPart, "S1 --> S2 : Dup % % mid");
+  includes(mermaidPart, "S2 --> S3 : Next % % end");
+  includes(mermaidPart, "S3 --> S1 : Back to state 1 - Loop % % back");
+  includes(mermaidPart, "class S3 fail");
+  includes(mermaidPart, "class S1 lasso");
+  excludes(mermaidPart, "S1 --> S1");
+  excludes(mermaidPart, "class S2 lasso");
+  for (const line of mermaidPart.split("\n")) {
+    if (!line.startsWith("%% ")) {
+      excludes(line, "%%");
+    }
+  }
+
+  const node0 = svgPart.match(/<g class="([^"]*)"[^>]*data-step-index="0"/);
+  const node1 = svgPart.match(/<g class="([^"]*)"[^>]*data-step-index="1"/);
+  assert.ok(node0 && node0[1].includes("trace-node-lasso"), svgPart);
+  assert.ok(node1 && !node1[1].includes("trace-node-lasso"), svgPart);
+  includes(svgPart, 'd="M 264 242 C 320 242, 320 50, 268 50"');
+});
+
 test("tlc_report.render_html builds self-contained XSS-safe report with table, SVG, JSON payload, diff, and Mermaid copy", () => {
   const payload = "</script><img src=x onerror=alert(1)><!-- -->\u2028\u2029";
   const script = [
@@ -457,6 +500,29 @@ test("tlc-matrix.sh rejects trailing slash TLC_HTML_REPORT without creating or m
   assert.equal(existsSync(join(dir, "calls")), false);
 });
 
+test("tlc-matrix.sh rejects dot and parent-dot TLC_HTML_REPORT paths without modifying target or calling TLC", () => {
+  const dir = fixture();
+  writeFileSync(join(dir, "One.tla"), "---- MODULE One ----\n====\n");
+  writeFileSync(join(dir, "One.matrix"), "spec One.tla\nrun n=1 | N=1\n");
+  writeFileSync(join(dir, "tools.jar"), "user supplied");
+  const java = fakeTlc(dir, 'echo started >> "$TASK_TRACE"; echo "Model checking completed. No error has been found."');
+  const existingFile = join(dir, "existing.txt");
+  writeFileSync(existingFile, "keep-existing");
+
+  for (const badPath of [`${existingFile}/.`, ".", "..", `${dir}/missing/..`]) {
+    const res = run(dir, "tlc-matrix.sh", [join(dir, "One.matrix")], {
+      JAVA: java,
+      TLC_JAR: join(dir, "tools.jar"),
+      TLC_HTML_REPORT: badPath,
+    });
+    assert.equal(res.status, 1, `${badPath}: ${res.stdout}${res.stderr}`);
+    includes(res.stdout, "FAIL TLC_HTML_REPORT");
+    includes(res.stdout, "is a directory");
+    assert.equal(readFileSync(existingFile, "utf8"), "keep-existing");
+    assert.equal(existsSync(join(dir, "calls")), false);
+  }
+});
+
 test("tlc-matrix.sh rejects overlong filename and 0o000 parent directory without traceback or TLC call", () => {
   const dir = fixture();
   writeFileSync(join(dir, "One.tla"), "---- MODULE One ----\n====\n");
@@ -637,4 +703,128 @@ test("tlc_report inline copy-mermaid script falls back to execCommand on clipboa
   assert.equal(threw.status, "Copy failed");
   assert.equal(threw.textareas.length, 1);
   assert.equal(threw.textareas[0].removed, true);
+});
+
+test("tlc_report inline script renderStep updates counter, header, diff, snapshot, and snapshot-summary across stuttering traces", () => {
+  const py = [
+    "import sys",
+    `sys.path.insert(0, ${JSON.stringify(scripts)})`,
+    "import tlc, tlc_report, tlc_trace",
+    "steps = (",
+    "  tlc_trace.Step(1, 'Init', (('x', '0'), ('y', '10')), (tlc_trace.VarDiff('x', None, '0'), tlc_trace.VarDiff('y', None, '10'))),",
+    "  tlc_trace.Step(2, 'Inc', (('x', '1'), ('y', '10')), (tlc_trace.VarDiff('x', '0', '1'),)),",
+    "  tlc_trace.Step(3, 'Stuttering', (), ()),",
+    ")",
+    "results = [tlc.Result(tlc.Outcome.FAIL, 'One', 'stutter', detail='err', trace=tlc_trace.Trace(steps))]",
+    "print(tlc_report.render_html('One.matrix', results, 'SUMMARY'), end='')",
+  ].join("\n");
+  const rendered = runPython(py);
+  assert.equal(rendered.status, 0, rendered.stderr);
+  const htmlDoc = rendered.stdout;
+  includes(htmlDoc, 'id="snapshot-summary-0"');
+  includes(htmlDoc, "Full State Snapshot (0 variables)");
+
+  const dataMatch = htmlDoc.match(/<script type="application\/json" id="trace-data-0">([\s\S]*?)<\/script>/);
+  assert.ok(dataMatch, "missing trace-data-0 payload");
+  const scriptMatches = [...htmlDoc.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+  assert.ok(scriptMatches.length >= 1, "expected inline report script");
+  const inlineJs = scriptMatches[scriptMatches.length - 1][1];
+
+  function makeEl(tag = "div") {
+    let text = "";
+    return {
+      tag,
+      children: [],
+      className: "",
+      colSpan: 0,
+      appendChild(child) { this.children.push(child); },
+      get textContent() { return text; },
+      set textContent(v) {
+        text = String(v);
+        if (text === "") this.children = [];
+      },
+    };
+  }
+
+  const counterEl = makeEl("span");
+  counterEl.textContent = "Step 3 / 3";
+  const headerEl = makeEl("h4");
+  headerEl.textContent = "State 3 — Stuttering";
+  const diffBodyEl = makeEl("tbody");
+  const snapSummaryEl = makeEl("summary");
+  snapSummaryEl.textContent = "Full State Snapshot (0 variables)";
+  const snapBodyEl = makeEl("tbody");
+
+  const dataScriptEl = { id: "trace-data-0", textContent: dataMatch[1] };
+  const traceNodes = [0, 1, 2].map((i) => {
+    const listeners = {};
+    const node = {
+      dataset: { traceId: "trace-0", stepIndex: String(i) },
+      selected: i === 2,
+      listeners,
+      addEventListener(evName, fn) { listeners[evName] = fn; },
+      classList: {
+        toggle(cls, force) {
+          if (cls === "is-selected") node.selected = Boolean(force);
+        },
+      },
+    };
+    return node;
+  });
+  const buttons = ["prev", "next"].map((action) => {
+    const listeners = {};
+    return {
+      dataset: { action, traceId: "trace-0" },
+      listeners,
+      addEventListener(evName, fn) { listeners[evName] = fn; },
+    };
+  });
+
+  const byId = {
+    "step-counter-0": counterEl,
+    "step-header-0": headerEl,
+    "diff-body-0": diffBodyEl,
+    "snapshot-summary-0": snapSummaryEl,
+    "snapshot-body-0": snapBodyEl,
+  };
+  const doc = {
+    getElementById: (id) => byId[id] || null,
+    createElement: (tag) => makeEl(tag),
+    querySelectorAll: (sel) => {
+      if (sel === 'script[type="application/json"][id^="trace-data-"]') return [dataScriptEl];
+      if (sel === ".trace-node[data-trace-id]" || sel === '.trace-node[data-trace-id="trace-0"]') return traceNodes;
+      if (sel === "button[data-action][data-trace-id]") return buttons;
+      return [];
+    },
+  };
+  vm.runInNewContext(inlineJs, { document: doc, navigator: {}, setTimeout: () => {} });
+
+  const rowTexts = (tbody) => tbody.children.map((tr) => tr.children.map((td) => (
+    td.children.length ? td.children[0].textContent : td.textContent
+  )));
+
+  buttons[0].listeners.click();
+  assert.equal(counterEl.textContent, "Step 2 / 3");
+  assert.equal(headerEl.textContent, "State 2 — Inc");
+  assert.equal(snapSummaryEl.textContent, "Full State Snapshot (2 variables)");
+  assert.deepEqual(rowTexts(diffBodyEl), [["x", "0", "1"]]);
+  assert.deepEqual(rowTexts(snapBodyEl), [["x", "1"], ["y", "10"]]);
+  assert.deepEqual(traceNodes.map((n) => n.selected), [false, true, false]);
+
+  traceNodes[0].listeners.click();
+  assert.equal(counterEl.textContent, "Step 1 / 3");
+  assert.equal(headerEl.textContent, "State 1 — Init");
+  assert.equal(snapSummaryEl.textContent, "Full State Snapshot (2 variables)");
+  assert.deepEqual(rowTexts(diffBodyEl), [["x", "(initial)", "0"], ["y", "(initial)", "10"]]);
+  assert.deepEqual(rowTexts(snapBodyEl), [["x", "0"], ["y", "10"]]);
+  assert.deepEqual(traceNodes.map((n) => n.selected), [true, false, false]);
+
+  buttons[1].listeners.click();
+  buttons[1].listeners.click();
+  assert.equal(counterEl.textContent, "Step 3 / 3");
+  assert.equal(headerEl.textContent, "State 3 — Stuttering");
+  assert.equal(snapSummaryEl.textContent, "Full State Snapshot (0 variables)");
+  assert.deepEqual(rowTexts(diffBodyEl), [["No variable changes in this step."]]);
+  assert.deepEqual(rowTexts(snapBodyEl), []);
+  assert.deepEqual(traceNodes.map((n) => n.selected), [false, false, true]);
 });

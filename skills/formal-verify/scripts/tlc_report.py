@@ -8,7 +8,7 @@ import html
 import json
 import re
 import sys
-from datetime import datetime, timezone
+import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -32,7 +32,7 @@ def _sanitize_mermaid(text: str) -> str:
     cleaned = _flatten(text)
     cleaned = cleaned.replace("-->", "→").replace("|->", "↦")
     cleaned = cleaned.replace("<<", "«").replace(">>", "»")
-    return (
+    cleaned = (
         cleaned.replace('"', "'")
         .replace(";", ",")
         .replace("<", "‹")
@@ -41,6 +41,9 @@ def _sanitize_mermaid(text: str) -> str:
         .replace("{", "(")
         .replace("}", ")")
     )
+    while "%%" in cleaned:
+        cleaned = cleaned.replace("%%", "% %")
+    return cleaned
 
 
 def _mermaid_step_label(step: tlc_trace.Step) -> str:
@@ -61,33 +64,35 @@ def to_mermaid(trace: tlc_trace.Trace, *, kind: str = "fail", title: str = "") -
         lines.append(f"%% {_sanitize_mermaid(title)}")
     if not trace.steps:
         return "\n".join(lines) + "\n"
-    for step in trace.steps:
-        lines.append(f'state "{_mermaid_step_label(step)}" as S{step.number}')
-    lines.append(f"[*] --> S{trace.steps[0].number}")
-    for prev, step in zip(trace.steps, trace.steps[1:]):
+    first_by_num: dict[int, int] = {}
+    for idx, step in enumerate(trace.steps):
+        first_by_num.setdefault(step.number, idx + 1)
+        lines.append(f'state "{_mermaid_step_label(step)}" as S{idx + 1}')
+    lines.append("[*] --> S1")
+    for idx, step in enumerate(trace.steps[1:], start=1):
         action = _sanitize_mermaid(step.action)
         suffix = f" : {action}" if action else ""
-        lines.append(f"S{prev.number} --> S{step.number}{suffix}")
-    step_numbers = {step.number for step in trace.steps}
+        lines.append(f"S{idx} --> S{idx + 1}{suffix}")
+    last_node = f"S{len(trace.steps)}"
+    target_num = first_by_num.get(trace.lasso.target) if trace.lasso is not None else None
     if trace.lasso is not None:
         lasso_action = _sanitize_mermaid(trace.lasso.action)
         lasso_label = f"Back to state {trace.lasso.target}"
         if lasso_action:
             lasso_label += f" - {lasso_action}"
-        last_num = trace.steps[-1].number
-        if trace.lasso.target in step_numbers:
-            lines.append(f"S{last_num} --> S{trace.lasso.target} : {lasso_label}")
+        if target_num is not None:
+            lines.append(f"{last_node} --> S{target_num} : {lasso_label}")
         else:
-            lines.append(f"note right of S{last_num} : {lasso_label}")
+            lines.append(f"note right of {last_node} : {lasso_label}")
     lines.extend([
         "classDef fail fill:#fef2f2,stroke:#dc2626,color:#991b1b,stroke-width:2px",
         "classDef reach fill:#f0fdf4,stroke:#16a34a,color:#166534,stroke-width:2px",
         "classDef lasso fill:#fffbeb,stroke:#d97706,color:#92400e,stroke-dasharray:5 3",
     ])
     terminal_class = "reach" if kind == "witness" else "fail"
-    lines.append(f"class S{trace.steps[-1].number} {terminal_class}")
-    if trace.lasso is not None and trace.lasso.target in step_numbers:
-        lines.append(f"class S{trace.lasso.target} lasso")
+    lines.append(f"class {last_node} {terminal_class}")
+    if target_num is not None:
+        lines.append(f"class S{target_num} lasso")
     return "\n".join(lines) + "\n"
 
 
@@ -141,7 +146,9 @@ def render_svg(trace: tlc_trace.Trace, *, trace_id: str, kind: str = "fail") -> 
     steps = trace.steps
     safe_id = re.sub(r"[^a-zA-Z0-9_-]", "-", trace_id) or "trace"
     node_x, node_w, node_h, gap, pad_y = 16, 248, 68, 28, 16
-    index_by_num = {step.number: idx for idx, step in enumerate(steps)}
+    index_by_num: dict[int, int] = {}
+    for idx, step in enumerate(steps):
+        index_by_num.setdefault(step.number, idx)
     lasso_idx = index_by_num.get(trace.lasso.target) if trace.lasso else None
     width = node_x + node_w + (176 if lasso_idx is not None else 16)
     height = pad_y * 2 + max(1, len(steps)) * node_h + max(0, len(steps) - 1) * gap
@@ -262,6 +269,8 @@ _SCRIPT = """
         }
       }
     }
+    const snapSummary = document.getElementById("snapshot-summary-" + traceIdx);
+    if (snapSummary) snapSummary.textContent = "Full State Snapshot (" + step.values.length + " variables)";
     const snapBody = document.getElementById("snapshot-body-" + traceIdx);
     if (snapBody) {
       snapBody.textContent = "";
@@ -433,7 +442,7 @@ def _trace_card(idx: int, result: object) -> str:
         lasso_html,
         "      <table><thead><tr><th>Variable</th><th>Before</th><th>After</th></tr></thead>",
         f'      <tbody id="diff-body-{idx}">{_diff_rows(last_step)}</tbody></table>',
-        f'      <details style="margin-top:12px"><summary>Full State Snapshot ({len(last_step.values)} variables)</summary>',
+        f'      <details style="margin-top:12px"><summary id="snapshot-summary-{idx}">Full State Snapshot ({len(last_step.values)} variables)</summary>',
         '        <table><thead><tr><th>Variable</th><th>Value</th></tr></thead>',
         f'        <tbody id="snapshot-body-{idx}">{_snapshot_rows(last_step)}</tbody></table>',
         "      </details>",
@@ -454,7 +463,7 @@ def _trace_card(idx: int, result: object) -> str:
 
 def render_html(matrix_name: str, results: list, summary: str, *, only: str = "", generated_at: str | None = None) -> str:
     """Render a complete, self-contained HTML5 report for a TLC matrix run."""
-    timestamp = generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    timestamp = generated_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     has_failure = (not results) or any(r.outcome.value not in ("pass", "witness") for r in results)
     overall = "FAIL" if has_failure else "PASS"
     overall_cls = "badge-fail" if has_failure else "badge-pass"
