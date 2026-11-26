@@ -310,6 +310,10 @@ class Result:
     lines: tuple = ()
     states: int = 0
     violation: Violation | None = None
+    constants: str = ""
+    checks: tuple[str, ...] = ()
+    duration_s: float = 0.0
+    trace: tlc_trace.Trace | None = None
 
 
 @dataclass(frozen=True)
@@ -505,8 +509,10 @@ def run_task(checker, matrix_dir, task, work, source=None):
     spec, run = task.spec, task.run
     operator = task.reach.operator if task.reach else ""
     name = Path(spec).name.removesuffix(".tla")
+    run_constants = run.constants.strip()
+    run_checks = tuple(check.line for check in task.checks)
     if not (matrix_dir / spec).is_file():
-        return Result(Outcome.MISSING, name, run.label, detail=spec)
+        return Result(Outcome.MISSING, name, run.label, detail=spec, constants=run_constants, checks=run_checks)
     directory = Path(tempfile.mkdtemp(prefix="run.", dir=work))
     try:
         for module in (matrix_dir / spec).parent.glob("*.tla"):
@@ -520,22 +526,28 @@ def run_task(checker, matrix_dir, task, work, source=None):
         if not task.check_deadlock:
             config += "CHECK_DEADLOCK FALSE\n"
         if not operator:
+            start = time.monotonic()
             status, log, timed_out = checker.run(
                 directory, name, config + "\n".join(check.line for check in task.checks) + "\n",
                 reach=False, progress_label=f"{name} {run.label}",
             )
+            elapsed = time.monotonic() - start
             shutil.rmtree(directory / "states", ignore_errors=True)
-            return ordinary(name, run, status, log, checker.limit if timed_out else None)
+            result = ordinary(name, run, status, log, checker.limit if timed_out else None)
+            return replace(result, constants=run_constants, checks=run_checks, duration_s=elapsed)
         wrapper = f"Reach{uuid.uuid4().hex}"
         invariant = f"{wrapper}Negated"
         (directory / f"{wrapper}.tla").write_text(f"---- MODULE {wrapper} ----\nEXTENDS {name}\n{invariant} == ~{operator}\n====\n", encoding="utf-8")
         # Exhaustive UNREACHED checks in reach: mutations do not depend on shortest-trace determinism.
         reach_workers = checker.workers if source is not None else "1"
+        start = time.monotonic()
         status, log, timed_out = checker.run(
             directory, wrapper, config + f"INVARIANT {invariant}\n",
             reach=True, workers=reach_workers, progress_label=f"{name} reach {operator} {run.label}",
         )
-        return witness(name, run, operator, invariant, status, log, checker.limit if timed_out else None)
+        elapsed = time.monotonic() - start
+        result = witness(name, run, operator, invariant, status, log, checker.limit if timed_out else None)
+        return replace(result, constants=run_constants, checks=run_checks, duration_s=elapsed)
     finally:
         shutil.rmtree(directory, ignore_errors=True)
 
@@ -553,7 +565,7 @@ def ordinary(name, run, status, log, timeout_limit=None):
     errors = [line for line in log.split("\n") if line.startswith("Error:")]
     first = errors[0] if errors else ""
     return Result(Outcome.FAIL, name, run.label, detail=first, lines=(*errors[1:5], *reduced_trace(log)),
-                  violation=violation(first))
+                  violation=violation(first), trace=tlc_trace.parse(re.split(r"\r\n|\r|\n", log)))
 
 
 def witness(name, run, operator, invariant, status, log, timeout_limit=None):
@@ -568,7 +580,8 @@ def witness(name, run, operator, invariant, status, log, timeout_limit=None):
     elif status == 12 and f"Error: Invariant {invariant} is violated." in lines:
         length = sum(1 for line in lines if re.match(r"State [0-9]+:", line))
     if length:
-        return Result(Outcome.WITNESS, name, run.label, operator, f"{length} states ({length - 1} transitions)")
+        return Result(Outcome.WITNESS, name, run.label, operator, f"{length} states ({length - 1} transitions)",
+                      trace=tlc_trace.parse(re.split(r"\r\n|\r|\n", log)))
     if status == 0 and "No error has been found" in log:
         return Result(Outcome.UNREACHED, name, run.label, operator)
     return Result(Outcome.INCOMPLETE, name, run.label, operator, lines=tuple(log.removesuffix("\n").split("\n")) if log else ())
@@ -581,8 +594,10 @@ class Runner:
         self.tlc, self.matrix_dir, self.only, self.emit, self.work = tlc, matrix_dir, only, emit, work
         self.runs_total = self.passed = self.states = self.reach_total = self.reached = 0
         self.failed = False
+        self.results = []
 
     def report(self, result):
+        self.results.append(result)
         self.failed |= result.outcome not in (Outcome.PASS, Outcome.WITNESS)
         self.emit(result)
 
