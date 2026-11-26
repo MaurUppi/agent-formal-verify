@@ -628,12 +628,21 @@ def validate_report_path(raw: str) -> Path | None:
     trimmed = raw.strip()
     if not trimmed:
         return None
+    if trimmed.endswith(("/", os.sep)) or (os.altsep and trimmed.endswith(os.altsep)):
+        raise ValueError(f"TLC_HTML_REPORT {trimmed} is a directory")
     path = Path(trimmed)
-    if path.is_dir():
+    try:
+        is_dir = path.is_dir()
+        parent_is_dir = path.parent.is_dir()
+        exists = path.exists()
+        is_file = path.is_file() if exists else False
+    except OSError as error:
+        raise ValueError(f"TLC_HTML_REPORT {trimmed} is not accessible: {error}") from error
+    if is_dir:
         raise ValueError(f"TLC_HTML_REPORT {path} is a directory")
-    if not path.parent.is_dir():
+    if not parent_is_dir:
         raise ValueError(f"TLC_HTML_REPORT parent directory {path.parent} does not exist")
-    if path.exists() and not path.is_file():
+    if exists and not is_file:
         raise ValueError(f"TLC_HTML_REPORT {path} is not a regular file")
     try:
         fd, temp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")

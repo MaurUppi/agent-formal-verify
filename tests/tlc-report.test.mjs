@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
+import vm from "node:vm";
 import { excludes, fakeTlc, fixture, includes, logs, removeFixtures, root, run, scripts } from "./helpers.mjs";
 
 afterEach(removeFixtures);
@@ -423,4 +424,217 @@ test("mutate.py with TLC_HTML_REPORT set does not create or overwrite the report
   });
   assert.equal(res2.status, 0, res2.stdout + res2.stderr);
   assert.equal(readFileSync(existingReport, "utf8"), "sentinel");
+});
+
+test("tlc-matrix.sh rejects trailing slash TLC_HTML_REPORT without creating or modifying target", () => {
+  const dir = fixture();
+  writeFileSync(join(dir, "One.tla"), "---- MODULE One ----\n====\n");
+  writeFileSync(join(dir, "One.matrix"), "spec One.tla\nrun n=1 | N=1\n");
+  writeFileSync(join(dir, "tools.jar"), "user supplied");
+  const java = fakeTlc(dir, 'echo started >> "$TASK_TRACE"');
+
+  const missingOut = join(dir, "out-missing");
+  const resMissing = run(dir, "tlc-matrix.sh", [join(dir, "One.matrix")], {
+    JAVA: java,
+    TLC_JAR: join(dir, "tools.jar"),
+    TLC_HTML_REPORT: `${missingOut}/`,
+  });
+  assert.equal(resMissing.status, 1, resMissing.stdout + resMissing.stderr);
+  includes(resMissing.stdout, "FAIL TLC_HTML_REPORT");
+  assert.equal(existsSync(missingOut), false);
+  assert.equal(existsSync(join(dir, "calls")), false);
+
+  const existingOut = join(dir, "out-existing");
+  writeFileSync(existingOut, "keep-sentinel");
+  const resExisting = run(dir, "tlc-matrix.sh", [join(dir, "One.matrix")], {
+    JAVA: java,
+    TLC_JAR: join(dir, "tools.jar"),
+    TLC_HTML_REPORT: `${existingOut}/`,
+  });
+  assert.equal(resExisting.status, 1, resExisting.stdout + resExisting.stderr);
+  includes(resExisting.stdout, "FAIL TLC_HTML_REPORT");
+  assert.equal(readFileSync(existingOut, "utf8"), "keep-sentinel");
+  assert.equal(existsSync(join(dir, "calls")), false);
+});
+
+test("tlc-matrix.sh rejects overlong filename and 0o000 parent directory without traceback or TLC call", () => {
+  const dir = fixture();
+  writeFileSync(join(dir, "One.tla"), "---- MODULE One ----\n====\n");
+  writeFileSync(join(dir, "One.matrix"), "spec One.tla\nrun n=1 | N=1\n");
+  writeFileSync(join(dir, "tools.jar"), "user supplied");
+  const java = fakeTlc(dir, 'echo started >> "$TASK_TRACE"');
+
+  const overlong = run(dir, "tlc-matrix.sh", [join(dir, "One.matrix")], {
+    JAVA: java,
+    TLC_JAR: join(dir, "tools.jar"),
+    TLC_HTML_REPORT: join(dir, "a".repeat(300)),
+  });
+  assert.equal(overlong.status, 1, overlong.stdout + overlong.stderr);
+  includes(overlong.stdout, "FAIL TLC_HTML_REPORT");
+  excludes(overlong.stderr, "Traceback");
+  assert.equal(existsSync(join(dir, "calls")), false);
+
+  if (process.getuid && process.getuid() !== 0) {
+    const lockedDir = join(dir, "locked");
+    mkdirSync(lockedDir);
+    chmodSync(lockedDir, 0o000);
+    try {
+      const res = run(dir, "tlc-matrix.sh", [join(dir, "One.matrix")], {
+        JAVA: java,
+        TLC_JAR: join(dir, "tools.jar"),
+        TLC_HTML_REPORT: join(lockedDir, "report.html"),
+      });
+      assert.equal(res.status, 1, res.stdout + res.stderr);
+      includes(res.stdout, "FAIL TLC_HTML_REPORT");
+      excludes(res.stderr, "Traceback");
+      assert.equal(existsSync(join(dir, "calls")), false);
+    } finally {
+      chmodSync(lockedDir, 0o755);
+    }
+  }
+});
+
+test("tlc-matrix.sh rejects non-regular file (FIFO) TLC_HTML_REPORT without invoking TLC", (t) => {
+  const dir = fixture();
+  const fifoPath = join(dir, "report.fifo");
+  const mk = spawnSync("mkfifo", [fifoPath], { encoding: "utf8" });
+  if (mk.error || mk.status !== 0) {
+    t.skip("mkfifo unavailable");
+    return;
+  }
+  writeFileSync(join(dir, "One.tla"), "---- MODULE One ----\n====\n");
+  writeFileSync(join(dir, "One.matrix"), "spec One.tla\nrun n=1 | N=1\n");
+  writeFileSync(join(dir, "tools.jar"), "user supplied");
+  const java = fakeTlc(dir, 'echo started >> "$TASK_TRACE"');
+
+  const res = run(dir, "tlc-matrix.sh", [join(dir, "One.matrix")], {
+    JAVA: java,
+    TLC_JAR: join(dir, "tools.jar"),
+    TLC_HTML_REPORT: fifoPath,
+  });
+  assert.equal(res.status, 1, res.stdout + res.stderr);
+  includes(res.stdout, "FAIL TLC_HTML_REPORT");
+  assert.equal(existsSync(join(dir, "calls")), false);
+});
+
+test("tlc-matrix.sh with zero-run matrix or non-matching filter exits 1 without creating or overwriting TLC_HTML_REPORT", () => {
+  const dir = fixture();
+  writeFileSync(join(dir, "One.tla"), "---- MODULE One ----\n====\n");
+  writeFileSync(join(dir, "Zero.matrix"), "spec One.tla\n");
+  writeFileSync(join(dir, "One.matrix"), "spec One.tla\nrun n=1 | N=1\n");
+  writeFileSync(join(dir, "tools.jar"), "user supplied");
+  const java = fakeTlc(dir, 'echo "Model checking completed. No error has been found."');
+
+  const absentReport = join(dir, "zero-absent.html");
+  const zeroRes = run(dir, "tlc-matrix.sh", [join(dir, "Zero.matrix")], {
+    JAVA: java,
+    TLC_JAR: join(dir, "tools.jar"),
+    TLC_HTML_REPORT: absentReport,
+  });
+  assert.equal(zeroRes.status, 1, zeroRes.stdout + zeroRes.stderr);
+  includes(zeroRes.stdout, "FAIL no run");
+  assert.equal(existsSync(absentReport), false);
+
+  const existingReport = join(dir, "filter-keep.html");
+  writeFileSync(existingReport, "sentinel");
+  const filterRes = run(dir, "tlc-matrix.sh", [join(dir, "One.matrix"), "no-such-label"], {
+    JAVA: java,
+    TLC_JAR: join(dir, "tools.jar"),
+    TLC_HTML_REPORT: existingReport,
+  });
+  assert.equal(filterRes.status, 1, filterRes.stdout + filterRes.stderr);
+  includes(filterRes.stdout, "FAIL no run");
+  assert.equal(readFileSync(existingReport, "utf8"), "sentinel");
+});
+
+test("tlc_report.render_html handles empty Trace(()) without IndexError, trace link, or trace card", () => {
+  const script = [
+    "import sys",
+    `sys.path.insert(0, ${JSON.stringify(scripts)})`,
+    "import tlc, tlc_report, tlc_trace",
+    "results = [tlc.Result(tlc.Outcome.FAIL, 'One', 'empty-trace', detail='TLC failed without states', lines=('err line',), trace=tlc_trace.Trace(()))]",
+    "print(tlc_report.render_html('empty.matrix', results, 'SUMMARY 0 of 1 runs passed, 0 distinct states in total'), end='')",
+  ].join("\n");
+  const result = runPython(script);
+  assert.equal(result.status, 0, result.stderr);
+  excludes(result.stdout, 'href="#trace-');
+  excludes(result.stdout, 'class="card trace-card"');
+  includes(result.stdout, "err line");
+  includes(result.stdout, "no counter-example or witness traces");
+});
+
+test("tlc_report inline copy-mermaid script falls back to execCommand on clipboard rejection and cleans up textarea", async () => {
+  const py = [
+    "import sys",
+    `sys.path.insert(0, ${JSON.stringify(scripts)})`,
+    "import tlc, tlc_report, tlc_trace",
+    "trace = tlc_trace.Trace((tlc_trace.Step(1, 'Init', (('x', '0'),), (tlc_trace.VarDiff('x', None, '0'),)),))",
+    "results = [tlc.Result(tlc.Outcome.FAIL, 'One', 'n=1', detail='err', trace=trace)]",
+    "print(tlc_report.render_html('One.matrix', results, 'SUMMARY'), end='')",
+  ].join("\n");
+  const rendered = runPython(py);
+  assert.equal(rendered.status, 0, rendered.stderr);
+  const scriptMatches = [...rendered.stdout.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+  assert.ok(scriptMatches.length >= 1, "expected inline report script");
+  const inlineJs = scriptMatches[scriptMatches.length - 1][1];
+
+  async function triggerCopy(execMode) {
+    let clickHandler = null;
+    const statusEl = { textContent: "" };
+    const btn = {
+      dataset: { copyTarget: "mermaid-0" },
+      parentElement: { querySelector: (sel) => (sel === ".copy-status" ? statusEl : null) },
+      addEventListener: (ev, fn) => {
+        if (ev === "click") clickHandler = fn;
+      },
+    };
+    const textareas = [];
+    const execCalls = [];
+    const doc = {
+      body: { appendChild: (el) => { el.appended = true; } },
+      querySelectorAll: (sel) => (sel === "button.copy-mermaid" ? [btn] : []),
+      getElementById: (id) => (id === "mermaid-0" ? { textContent: "stateDiagram-v2\n" } : null),
+      createElement: (tag) => {
+        const el = {
+          tag,
+          value: "",
+          appended: false,
+          removed: false,
+          selected: false,
+          select: () => { el.selected = true; },
+          remove: () => { el.removed = true; },
+        };
+        textareas.push(el);
+        return el;
+      },
+      execCommand: (cmd) => {
+        execCalls.push(cmd);
+        if (execMode === "throw") throw new Error("exec blocked");
+        return execMode === "true";
+      },
+    };
+    const nav = { clipboard: { writeText: async () => { throw new Error("denied on file://"); } } };
+    vm.runInNewContext(inlineJs, { document: doc, navigator: nav, setTimeout: () => {} });
+    assert.ok(clickHandler, "expected click handler on button.copy-mermaid");
+    await clickHandler();
+    return { status: statusEl.textContent, textareas, execCalls };
+  }
+
+  const ok = await triggerCopy("true");
+  assert.deepEqual(ok.execCalls, ["copy"]);
+  assert.equal(ok.status, "Copied!");
+  assert.equal(ok.textareas.length, 1);
+  assert.equal(ok.textareas[0].removed, true);
+
+  const denied = await triggerCopy("false");
+  assert.deepEqual(denied.execCalls, ["copy"]);
+  assert.equal(denied.status, "Copy failed");
+  assert.equal(denied.textareas.length, 1);
+  assert.equal(denied.textareas[0].removed, true);
+
+  const threw = await triggerCopy("throw");
+  assert.deepEqual(threw.execCalls, ["copy"]);
+  assert.equal(threw.status, "Copy failed");
+  assert.equal(threw.textareas.length, 1);
+  assert.equal(threw.textareas[0].removed, true);
 });

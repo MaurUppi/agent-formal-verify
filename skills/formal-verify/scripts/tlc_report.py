@@ -304,20 +304,32 @@ _SCRIPT = """
       const status = btn.parentElement && btn.parentElement.querySelector(".copy-status");
       if (!code) return;
       const text = code.textContent || "";
-      try {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
+      let copied = false;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        try {
           await navigator.clipboard.writeText(text);
-        } else {
-          const ta = document.createElement("textarea");
+          copied = true;
+        } catch {
+          copied = false;
+        }
+      }
+      if (!copied) {
+        const ta = document.createElement("textarea");
+        try {
           ta.value = text;
           document.body.appendChild(ta);
           ta.select();
-          document.execCommand("copy");
+          copied = Boolean(document.execCommand && document.execCommand("copy"));
+        } catch {
+          copied = false;
+        } finally {
           ta.remove();
         }
+      }
+      if (copied) {
         if (status) { status.textContent = "Copied!"; setTimeout(() => { status.textContent = ""; }, 1500); }
-      } catch {
-        if (status) status.textContent = "Copy failed";
+      } else if (status) {
+        status.textContent = "Copy failed";
       }
     });
   });
@@ -352,7 +364,7 @@ def _table_row(idx: int, result: object) -> str:
     outcome_val = result.outcome.value
     badge_cls = f"badge-{outcome_val.replace(' ', '-')}"
     checks = ", ".join(result.checks) if result.checks else "-"
-    if result.trace is not None:
+    if result.trace is not None and bool(result.trace.steps):
         ref = f'<a href="#trace-{idx}">View trace ({len(result.trace.steps)})</a>'
     elif result.lines:
         joined = _esc("\n".join(result.lines))
@@ -449,7 +461,7 @@ def render_html(matrix_name: str, results: list, summary: str, *, only: str = ""
     total_s = sum(r.duration_s for r in results)
     filter_html = f"<span>Filter: <code>{_esc(only)}</code></span>" if only else ""
     rows_html = "\n".join(_table_row(idx, r) for idx, r in enumerate(results))
-    trace_cards = [_trace_card(idx, r) for idx, r in enumerate(results) if r.trace is not None]
+    trace_cards = [_trace_card(idx, r) for idx, r in enumerate(results) if r.trace is not None and bool(r.trace.steps)]
     traces_html = "\n".join(trace_cards) if trace_cards else '<p class="empty-note">There are no counter-example or witness traces for this run.</p>'
     return "\n".join([
         "<!DOCTYPE html>",
