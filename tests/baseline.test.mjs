@@ -1,10 +1,11 @@
 // Copyright (c) 2026 Michael Denyer
 // SPDX-License-Identifier: GPL-3.0-only
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import { fixture, installKani, removeFixtures, root, run } from "./helpers.mjs";
+import { fixture, installKani, removeFixtures, root, run, scripts } from "./helpers.mjs";
 
 afterEach(removeFixtures);
 
@@ -70,6 +71,40 @@ function assertUnchanged({ files, result, out }, target) {
 
 const tla = (from, to) => (change) => edit(change.spec, from, to);
 const rust = (from, to) => (change) => edit(change.rust, from, to);
+
+function crate(files) {
+  const dir = realpathSync(fixture());
+  for (const [name, text] of Object.entries(files)) {
+    mkdirSync(join(dir, name, ".."), { recursive: true });
+    writeFileSync(join(dir, name), text);
+  }
+  return dir;
+}
+
+// Read the routes to target in a crate of files with a new RouteReader, as [crate root relative to the crate, guards,
+// module path], with the label the record holds for them, or the reader's error with the crate's path as <crate>.
+function routes(files, target) {
+  const dir = crate(files);
+  const script = [
+    "import json, sys",
+    `sys.path.insert(0, ${JSON.stringify(scripts)})`,
+    "from pathlib import Path",
+    "import baseline",
+    `crate, path = Path(${JSON.stringify(dir)}), Path(${JSON.stringify(join(dir, target))})`,
+    "try:",
+    "    found = baseline.RouteReader().routes(path)",
+    "except ValueError as error:",
+    "    print(json.dumps({'error': str(error).replace(str(crate), '<crate>')}))",
+    "else:",
+    "    routes = [[str(route.root.relative_to(crate)), route.guards, route.module] for route in found]",
+    "    print(json.dumps({'routes': routes, 'label': baseline.route_label(path, found)}))",
+  ].join("\n");
+  const result = spawnSync("python3", ["-B", "-c", script], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+const harness = "#[kani::proof]\nfn a() { kani::cover!(true); }\n";
+const cargoToml = '[package]\nname = "p"\nversion = "0.1.0"\n';
 
 test("a re-frozen Lean declaration is changed and named, whichever hash moved", () => {
   for (const field of ["typeHash", "valueHash"]) {
@@ -419,15 +454,6 @@ test("a cfg that can switch a recorded Kani harness off is changed, and cfg(kani
 });
 
 test("a cfg on the out-of-line mod declarations that lead to a recorded Kani harness file is changed", () => {
-  const crate = (files) => {
-    const dir = realpathSync(fixture());
-    for (const [name, text] of Object.entries(files)) {
-      mkdirSync(join(dir, name, ".."), { recursive: true });
-      writeFileSync(join(dir, name), text);
-    }
-    return dir;
-  };
-  const harness = "#[kani::proof]\nfn a() { kani::cover!(true); }\n";
   const both = crate({ "lib.rs": "#[cfg(kani)]\nmod proofs;\n", "proofs.rs": harness });
   const [lib, proofs, record] = ["lib.rs", "proofs.rs", "record.json"].map((name) => join(both, name));
   assert.equal(baseline(both, "record", record, lib, proofs).status, 0);
@@ -435,37 +461,6 @@ test("a cfg on the out-of-line mod declarations that lead to a recorded Kani har
   const added = baseline(both, "compare", record);
   assert.equal(added.status, 1);
   assert.deepEqual(lines(added), [`UNCHANGED ${lib}`, `CHANGED ${proofs}`, "  changed harness a", "    old: ", '    new: cfg(feature = "slow-proofs")', "SUMMARY 1 unchanged, 1 changed"]);
-
-  const nested = crate({
-    "src/lib.rs": "#![cfg(unix)]\n#[cfg(a)]\nmod verify;\n#[cfg(d)] pub mod checks;\n",
-    "src/verify.rs": "mod inner {\n    #[cfg(b)]\n    mod proofs;\n}\n",
-    "src/verify/inner/proofs.rs": harness,
-    "src/checks/mod.rs": harness,
-  });
-  const [inner, checks, nestedRecord] = ["src/verify/inner/proofs.rs", "src/checks/mod.rs", "record.json"].map((name) => join(nested, name));
-  assert.equal(baseline(nested, "record", nestedRecord, inner, checks).status, 0);
-  edit(join(nested, "src/lib.rs"), "#[cfg(a)]\n", "");
-  edit(join(nested, "src/lib.rs"), "#[cfg(d)] ", "");
-  assert.deepEqual(lines(baseline(nested, "compare", nestedRecord)), [
-    `CHANGED ${checks}`, "  changed harness a", "    old: cfg(unix) cfg(d)", "    new: cfg(unix)",
-    `CHANGED ${inner}`, "  changed harness a", "    old: cfg(unix) cfg(a) cfg(b)", "    new: cfg(unix) cfg(b)",
-    "SUMMARY 0 unchanged, 2 changed",
-  ]);
-
-  const guards = (files, target) => {
-    const dir = crate(files);
-    const recordPath = join(dir, "record.json");
-    assert.equal(baseline(dir, "record", recordPath, join(dir, target)).status, 0);
-    return JSON.parse(readFileSync(recordPath, "utf8")).models[join(dir, target)].surface["harness a"];
-  };
-  assert.equal(guards({ "main.rs": "#[cfg(e)] mod outer {\n    #![cfg(f)]\n    mod proofs;\n}\n", "outer/proofs.rs": harness }, "outer/proofs.rs"), "cfg(e) cfg(f)");
-  assert.equal(guards({ "stray.rs": "#[cfg(g)] mod proofs;\n", "stray/Cargo.toml": "", "stray/lib.rs": "mod proofs;\n", "stray/proofs.rs": harness }, "stray/proofs.rs"), "");
-  assert.equal(guards({ "mod.rs": "fn open() {\n", "loose/proofs.rs": harness }, "loose/proofs.rs"), "");
-
-  const broken = crate({ "lib.rs": "mod proofs;\nfn open() {\n", "proofs.rs": harness });
-  const failed = baseline(broken, "record", join(broken, "record.json"), join(broken, "proofs.rs"));
-  assert.equal(failed.status, 1);
-  assert.match(failed.stdout, new RegExp(`^FAIL baseline: ${join(broken, "proofs.rs")}: no module declaration that the record can read leads to this file from a crate root; .*; ${join(broken, "lib.rs")}: unbalanced \\{`));
 });
 
 test("a cfg after an attribute that holds fn or mod is read up to the item's own keyword", () => {
@@ -474,131 +469,30 @@ test("a cfg after an attribute that holds fn or mod is read up to the item's own
   assertChanged(added, "rust", "changed harness first", 'new: cfg(feature = "slow-proofs")');
   const module = ({ rust: path }) => writeFileSync(path, "#[cfg_attr(any(), doc(mod y))]\n#[cfg(b)]\nmod m {\n    #[kani::proof]\n    fn a() {}\n}\n");
   assertChanged(recordedThenEdited(module, "rust", rust("#[cfg(b)]\n", "")), "rust", "changed harness m::a", "old: cfg(b)");
-  const files = models();
-  const proofs = join(files.dir, "kani/proofs.rs");
-  writeFileSync(files.rust, "#[cfg_attr(any(), doc(mod proofs))]\n#[cfg(c)]\nmod proofs;\n");
-  writeFileSync(proofs, "#[kani::proof]\nfn a() {}\n");
-  assert.equal(baseline(files.dir, "record", files.record, proofs).status, 0);
-  assert.equal(JSON.parse(readFileSync(files.record, "utf8")).models[proofs].surface["harness a"], "cfg(c)");
-  const outer = join(files.dir, "kani/outer/proofs.rs");
-  mkdirSync(join(files.dir, "kani/outer"));
-  writeFileSync(files.rust, "#[doc(mod q)]\n#[cfg(o)]\nmod outer {\n    #[cfg(c)]\n    mod proofs;\n}\n");
-  writeFileSync(outer, "#[kani::proof]\nfn a() {}\n");
-  assert.equal(baseline(files.dir, "record", files.record, outer).status, 0);
-  assert.equal(JSON.parse(readFileSync(files.record, "utf8")).models[outer].surface["harness a"], "cfg(o) cfg(c)");
 });
 
-test("a cfg on a #[path] declaration or in another crate root that leads to a Kani harness file is changed", () => {
-  const crate = (files) => {
-    const dir = realpathSync(fixture());
-    for (const [name, text] of Object.entries(files)) {
-      mkdirSync(join(dir, name, ".."), { recursive: true });
-      writeFileSync(join(dir, name), text);
-    }
-    return dir;
-  };
-  const harness = "#[kani::proof]\nfn a() { kani::cover!(true); }\n";
-  const recorded = (files, target) => {
-    const dir = crate(files);
-    const result = baseline(dir, "record", join(dir, "record.json"), join(dir, target));
-    return { dir, result, record: join(dir, "record.json") };
-  };
-  const guards = (files, target) => {
-    const { dir, result, record } = recorded(files, target);
-    assert.equal(result.status, 0, result.stdout);
-    return JSON.parse(readFileSync(record, "utf8")).models[join(dir, target)].surface["harness a"];
-  };
-
-  const repro = recorded({ "lib.rs": '#[path = "checks.rs"]\nmod proofs;\n', "checks.rs": harness }, "checks.rs");
-  assert.equal(repro.result.status, 0, repro.result.stdout);
-  edit(join(repro.dir, "lib.rs"), "mod proofs;", '#[cfg(feature = "slow")]\nmod proofs;');
-  const added = baseline(repro.dir, "compare", repro.record);
-  assert.equal(added.status, 1);
-  assert.deepEqual(lines(added), [`CHANGED ${join(repro.dir, "checks.rs")}`, "  changed harness a", "    old: ", '    new: cfg(feature = "slow")', "SUMMARY 0 unchanged, 1 changed"]);
-
-  assert.equal(guards({ "lib.rs": '#[path = "x.rs"] mod y;\n', "x.rs": "#[cfg(c)] mod z;\n", "z.rs": harness }, "z.rs"), "cfg(c)");
-  assert.equal(guards({ "lib.rs": "mod a;\n", "a.rs": '#[cfg(b)] #[path = "d"] mod m {\n    mod q;\n}\n', "d/q.rs": harness }, "d/q.rs"), "cfg(b)");
-  assert.equal(guards({ "lib.rs": "mod a;\n", "a.rs": 'mod m {\n    #[cfg(e)] #[path = "p.rs"] mod p;\n}\n', "a/m/p.rs": harness }, "a/m/p.rs"), "cfg(e)");
-  assert.equal(guards({ "lib.rs": '#[cfg_attr(feature = "x", path = "other.rs")]\nmod proofs;\n', "proofs.rs": harness, "other.rs": "" }, "proofs.rs"), 'cfg_attr(feature = "x", path = "other.rs")');
-  assert.equal(guards({ "lib.rs": '#[path = "lib.rs"]\nmod again;\n#[cfg(w)] mod proofs;\n', "proofs.rs": harness }, "proofs.rs"), "cfg(w)");
-  assert.equal(guards({ "lib.rs": "mod other;\nmod proofs;\n", "other.rs": "fn open() {\n", "proofs.rs": harness }, "proofs.rs"), "");
-
-  const cargo = { "Cargo.toml": '[package]\nname = "p"\nversion = "0.1.0"\n', "src/lib.rs": "" };
-  assert.equal(guards({ ...cargo, "tests/kani/main.rs": "#[cfg(t)] mod proofs;\n", "tests/kani/proofs.rs": harness }, "tests/kani/proofs.rs"), "cfg(t)");
-  assert.equal(guards({ ...cargo, "src/bin/tool/main.rs": "#[cfg(u)] mod proofs;\n", "src/bin/tool/proofs.rs": harness }, "src/bin/tool/proofs.rs"), "cfg(u)");
-  const library = { "Cargo.toml": "[package]\nname = \"p\"\nversion = \"0.1.0\"\n\n[lib]\npath = 'code/root.rs'\n", "code/root.rs": "#[cfg(v)] mod proofs;\n", "code/proofs.rs": harness };
-  assert.equal(guards(library, "code/proofs.rs"), "cfg(v)");
-  assert.equal(guards({ "Cargo.toml": "[workspace]\nmembers = []\n", "crates/foo/lib.rs": "#[cfg(w)] mod proofs;\n", "crates/foo/proofs.rs": harness }, "crates/foo/proofs.rs"), "cfg(w)");
-  assert.equal(guards({ ...cargo, "src/main.rs": `#[cfg(z)] #[path = "lib.rs"] mod lib;\nfn main() { let path = "lib.rs"; }\n`, "src/lib.rs": harness }, "src/lib.rs"), "routes(lib.rs: unguarded; main.rs: cfg(z))");
-  assert.equal(guards({ ...cargo, "src/main.rs": `fn main() { let path = "lib.rs"; }\n`, "src/lib.rs": harness }, "src/lib.rs"), "");
-  assert.equal(guards({ "lib.rs": "#[cfg(m)] mod r#match;\n", "match/mod.rs": harness }, "match/mod.rs"), "cfg(m)");
-  assert.equal(guards({ "lib.rs": 'mod proofs;\n#[path = "sys\\\\win.rs"] mod sys;\n', "proofs.rs": harness }, "proofs.rs"), "");
-
-  const wrapped = recorded({ "lib.rs": "mod proofs;\n", "proofs.rs": harness }, "proofs.rs");
-  writeFileSync(join(wrapped.dir, "lib.rs"), "cfg_if::cfg_if! { if #[cfg(feature = \"slow\")] { mod proofs; } }\n");
-  const failed = baseline(wrapped.dir, "compare", wrapped.record);
+test("compare fails for a recorded Kani harness file that its only readable route no longer reaches", () => {
+  const wrapped = crate({ "lib.rs": "mod proofs;\n", "proofs.rs": harness });
+  const [proofs, record] = ["proofs.rs", "record.json"].map((name) => join(wrapped, name));
+  assert.equal(baseline(wrapped, "record", record, proofs).status, 0);
+  writeFileSync(join(wrapped, "lib.rs"), "cfg_if::cfg_if! { if #[cfg(feature = \"slow\")] { mod proofs; } }\n");
+  const failed = baseline(wrapped, "compare", record);
   assert.equal(failed.status, 1);
-  assert.equal(lines(failed)[0], `CHANGED ${join(wrapped.dir, "proofs.rs")}`);
+  assert.equal(lines(failed)[0], `CHANGED ${proofs}`);
   assert.match(lines(failed)[1], /^ {2}FAIL .*proofs\.rs: no module declaration that the record can read leads to this file/);
-  const pathed = recorded({ "lib.rs": 'fn f() {\n    #[path = "checks.rs"] mod proofs;\n}\n', "checks.rs": harness }, "checks.rs");
-  assert.match(pathed.result.stdout, /checks\.rs: no module declaration that the record can read leads to this file/);
-  const stray = recorded({ "lib.rs": "", "stray.rs": harness }, "stray.rs");
-  assert.equal(stray.result.status, 1);
-  assert.match(stray.result.stdout, new RegExp(`^FAIL baseline: ${join(stray.dir, "stray.rs")}: no module declaration that the record can read leads to this file from a crate root`));
 });
 
-test("removing or guarding one of several routes to a Kani harness file is changed", () => {
-  const harness = "#[kani::proof]\nfn a() { kani::cover!(true); }\n";
-  // compiled names the harnesses that Kani compiles from target.
-  const recorded = (files, target = "src/proofs.rs", compiled = ["proofs::a"]) => {
-    const dir = realpathSync(fixture());
-    for (const [name, text] of Object.entries({ "Cargo.toml": '[package]\nname = "p"\nversion = "0.1.0"\n', ...files, [target]: harness })) {
-      mkdirSync(join(dir, name, ".."), { recursive: true });
-      writeFileSync(join(dir, name), text);
-    }
-    compiles(dir, target, compiled);
-    const record = join(dir, "record.json");
-    const proofs = join(dir, target);
-    assert.equal(baseline(dir, "record", record, proofs).status, 0);
-    return { dir, record, proofs, guards: JSON.parse(readFileSync(record, "utf8")).models[proofs].surface["harness a"] };
-  };
-  const compared = ({ dir, record }) => {
-    const result = baseline(dir, "compare", record);
-    assert.equal(result.status, 1, result.stdout);
-    return lines(result);
-  };
-
-  const both = { "src/lib.rs": "mod proofs;\n", "src/main.rs": '#[cfg(feature = "slow")]\nmod proofs;\nfn main() {}\n' };
-  const removed = recorded(both);
-  assert.equal(removed.guards, 'routes(lib.rs: unguarded; main.rs: cfg(feature = "slow"))');
-  writeFileSync(join(removed.dir, "src/lib.rs"), "");
-  assert.deepEqual(compared(removed), [`CHANGED ${removed.proofs}`, "  changed harness a", '    old: routes(lib.rs: unguarded; main.rs: cfg(feature = "slow"))', '    new: cfg(feature = "slow")', "SUMMARY 0 unchanged, 1 changed"]);
-
-  const guarded = recorded(both);
-  edit(join(guarded.dir, "src/lib.rs"), "mod proofs;", "#[cfg(x)] mod proofs;");
-  assert.deepEqual(compared(guarded).slice(2, 4), ['    old: routes(lib.rs: unguarded; main.rs: cfg(feature = "slow"))', '    new: routes(lib.rs: cfg(x); main.rs: cfg(feature = "slow"))']);
-
-  const swapped = recorded(both);
-  writeFileSync(join(swapped.dir, "src/lib.rs"), '#[cfg(feature = "slow")]\nmod proofs;\n');
-  writeFileSync(join(swapped.dir, "src/main.rs"), "mod proofs;\nfn main() {}\n");
-  assert.deepEqual(compared(swapped).slice(2, 4), ['    old: routes(lib.rs: unguarded; main.rs: cfg(feature = "slow"))', '    new: routes(lib.rs: cfg(feature = "slow"); main.rs: unguarded)']);
-
-  const replaced = recorded(both);
-  writeFileSync(join(replaced.dir, "src/lib.rs"), "");
-  mkdirSync(join(replaced.dir, "tests"));
-  writeFileSync(join(replaced.dir, "tests/t.rs"), '#[path = "../src/proofs.rs"]\nmod proofs;\n');
-  assert.deepEqual(compared(replaced).slice(2, 4), ['    old: routes(lib.rs: unguarded; main.rs: cfg(feature = "slow"))', '    new: routes(../tests/t.rs: unguarded; main.rs: cfg(feature = "slow"))']);
-
-  const twice = recorded({ "src/lib.rs": "mod proofs;\n", "src/main.rs": "mod proofs;\nfn main() {}\n" });
-  assert.equal(twice.guards, "routes(lib.rs: unguarded; main.rs: unguarded)");
-  writeFileSync(join(twice.dir, "src/main.rs"), "fn main() {}\n");
-  assert.deepEqual(compared(twice).slice(2, 4), ["    old: routes(lib.rs: unguarded; main.rs: unguarded)", "    new: "]);
-
-  const root = recorded({ "src/lib.rs": "mod proofs;\n", "src/main.rs": '#[cfg(z)] #[path = "lib.rs"] mod lib;\nfn main() {}\n' });
-  assert.equal(root.guards, "routes(lib.rs: unguarded; main.rs: cfg(z))");
-
-  const module = recorded({ "src/lib.rs": '#[cfg(feature = "x")] mod a;\n', "src/a/mod.rs": "mod main;\n", "src/a/main.rs": "mod proofs;\n" }, "src/a/main/proofs.rs", []);
-  assert.equal(module.guards, 'cfg(feature = "x")');
+test("removing one of several routes to a Kani harness file is changed", () => {
+  const files = { "Cargo.toml": '[package]\nname = "p"\nversion = "0.1.0"\n', "src/lib.rs": "mod proofs;\n", "src/main.rs": '#[cfg(feature = "slow")]\nmod proofs;\nfn main() {}\n', "src/proofs.rs": harness };
+  const dir = crate(files);
+  const [record, proofs] = ["record.json", "src/proofs.rs"].map((name) => join(dir, name));
+  compiles(dir, "src/proofs.rs", ["proofs::a"]);
+  assert.equal(baseline(dir, "record", record, proofs).status, 0);
+  assert.equal(JSON.parse(readFileSync(record, "utf8")).models[proofs].surface["harness a"], 'routes(lib.rs: unguarded; main.rs: cfg(feature = "slow"))');
+  writeFileSync(join(dir, "src/lib.rs"), "");
+  const result = baseline(dir, "compare", record);
+  assert.equal(result.status, 1, result.stdout);
+  assert.deepEqual(lines(result), [`CHANGED ${proofs}`, "  changed harness a", '    old: routes(lib.rs: unguarded; main.rs: cfg(feature = "slow"))', '    new: cfg(feature = "slow")', "SUMMARY 0 unchanged, 1 changed"]);
 });
 
 test("each harness that Kani compiles from a recorded file must be on a route the record reads, and must keep compiling", () => {
@@ -704,72 +598,111 @@ test("a mod declaration inside cfg_if! is not a route the record reads, so Kani'
   assert.equal(beside.result.stdout, `FAIL baseline: ${beside.proofs}: Kani compiles proofs::a from this file, but no route that the record reads gives that name; declare the module with \`mod <name>;\` or \`#[path = "..."]\` outside macros and function bodies\n`);
 });
 
-test("a route to a Kani harness file through include! is followed, and an include! inside a macro or function body is not", () => {
-  const harness = "#[kani::proof]\nfn a() { kani::cover!(true); }\n";
-  const recorded = (files, target) => {
-    const dir = realpathSync(fixture());
-    for (const [name, text] of Object.entries({ ...files, [target]: harness })) {
-      mkdirSync(join(dir, name, ".."), { recursive: true });
-      writeFileSync(join(dir, name), text);
-    }
-    const record = join(dir, "record.json");
-    const result = baseline(dir, "record", record, join(dir, target));
-    const guards = () => JSON.parse(readFileSync(record, "utf8")).models[join(dir, target)].surface["harness a"];
-    return { dir, record, result, guards };
+test("the route reader follows out-of-line mod declarations from the crate roots and reads the cfg guards on each", () => {
+  const nested = {
+    "src/lib.rs": "#![cfg(unix)]\n#[cfg(a)]\nmod verify;\n#[cfg(d)] pub mod checks;\n",
+    "src/verify.rs": "mod inner {\n    #[cfg(b)]\n    mod proofs;\n}\n",
+    "src/verify/inner/proofs.rs": harness,
+    "src/checks/mod.rs": harness,
   };
-  const guards = (files, target) => {
-    const { result, guards: read } = recorded(files, target);
-    assert.equal(result.status, 0, result.stdout);
-    return read();
-  };
-  const failure = (files, target) => {
-    const { result } = recorded(files, target);
-    assert.equal(result.status, 1, result.stdout);
-    return result.stdout;
-  };
+  assert.deepEqual(routes(nested, "src/verify/inner/proofs.rs").routes, [["src/lib.rs", "cfg(unix) cfg(a) cfg(b)", "verify::inner::proofs"]]);
+  assert.deepEqual(routes(nested, "src/checks/mod.rs").routes, [["src/lib.rs", "cfg(unix) cfg(d)", "checks"]]);
+  assert.deepEqual(routes({ "main.rs": "#[cfg(e)] mod outer {\n    #![cfg(f)]\n    mod proofs;\n}\n", "outer/proofs.rs": harness }, "outer/proofs.rs").routes, [["main.rs", "cfg(e) cfg(f)", "outer::proofs"]]);
+  // An attribute that holds `mod` is read up to the declaration's own keyword.
+  assert.deepEqual(routes({ "lib.rs": "#[cfg_attr(any(), doc(mod proofs))]\n#[cfg(c)]\nmod proofs;\n", "proofs.rs": harness }, "proofs.rs").routes, [["lib.rs", "cfg(c)", "proofs"]]);
+  assert.deepEqual(routes({ "lib.rs": "#[doc(mod q)]\n#[cfg(o)]\nmod outer {\n    #[cfg(c)]\n    mod proofs;\n}\n", "outer/proofs.rs": harness }, "outer/proofs.rs").routes, [["lib.rs", "cfg(o) cfg(c)", "outer::proofs"]]);
+  // A declaration in a file outside the crate's module tree is no route, and a file that does not parse hides no other.
+  assert.deepEqual(routes({ "stray.rs": "#[cfg(g)] mod proofs;\n", "stray/Cargo.toml": "", "stray/lib.rs": "mod proofs;\n", "stray/proofs.rs": harness }, "stray/proofs.rs").routes, [["stray/lib.rs", "", "proofs"]]);
+  assert.deepEqual(routes({ "lib.rs": "mod other;\nmod proofs;\n", "other.rs": "fn open() {\n", "proofs.rs": harness }, "proofs.rs").routes, [["lib.rs", "", "proofs"]]);
+  assert.deepEqual(routes({ "lib.rs": "#[cfg(m)] mod r#match;\n", "match/mod.rs": harness }, "match/mod.rs").routes, [["lib.rs", "cfg(m)", "r#match"]]);
+  // A file in no crate, and a crate root that no declaration reaches, are each their own crate root.
+  assert.deepEqual(routes({ "mod.rs": "fn open() {\n", "loose/proofs.rs": harness }, "loose/proofs.rs"), { routes: [["loose/proofs.rs", "", ""]], label: "" });
+  assert.deepEqual(routes({ "Cargo.toml": cargoToml, "src/main.rs": `fn main() { let path = "lib.rs"; }\n`, "src/lib.rs": harness }, "src/lib.rs"), { routes: [["src/lib.rs", "", ""]], label: "" });
+});
 
-  const included = recorded({ "lib.rs": '#[path = "sub/proofs.rs"] mod proofs;\ninclude!("sub/items.rs");\n', "sub/items.rs": '#[path = "proofs.rs"] mod again;\n' }, "sub/proofs.rs");
-  assert.equal(included.result.status, 0, included.result.stdout);
-  assert.equal(included.guards(), "routes(../lib.rs: unguarded; ../lib.rs: unguarded)");
-  edit(join(included.dir, "lib.rs"), "include!", '#[cfg(feature = "slow")] include!');
-  const switched = baseline(included.dir, "compare", included.record);
-  assert.equal(switched.status, 1, switched.stdout);
-  assert.deepEqual(lines(switched).slice(2, 4), ["    old: routes(../lib.rs: unguarded; ../lib.rs: unguarded)", '    new: routes(../lib.rs: unguarded; ../lib.rs: cfg(feature = "slow"))']);
+test("the route reader follows #[path] and cfg_attr paths, and each crate root that Cargo names", () => {
+  assert.deepEqual(routes({ "lib.rs": '#[path = "checks.rs"]\n#[cfg(feature = "slow")]\nmod proofs;\n', "checks.rs": harness }, "checks.rs").routes, [["lib.rs", 'cfg(feature = "slow")', "proofs"]]);
+  assert.deepEqual(routes({ "lib.rs": '#[path = "x.rs"] mod y;\n', "x.rs": "#[cfg(c)] mod z;\n", "z.rs": harness }, "z.rs").routes, [["lib.rs", "cfg(c)", "y::z"]]);
+  assert.deepEqual(routes({ "lib.rs": "mod a;\n", "a.rs": '#[cfg(b)] #[path = "d"] mod m {\n    mod q;\n}\n', "d/q.rs": harness }, "d/q.rs").routes, [["lib.rs", "cfg(b)", "a::m::q"]]);
+  assert.deepEqual(routes({ "lib.rs": "mod a;\n", "a.rs": 'mod m {\n    #[cfg(e)] #[path = "p.rs"] mod p;\n}\n', "a/m/p.rs": harness }, "a/m/p.rs").routes, [["lib.rs", "cfg(e)", "a::m::p"]]);
+  assert.deepEqual(routes({ "lib.rs": '#[cfg_attr(feature = "x", path = "other.rs")]\nmod proofs;\n', "proofs.rs": harness, "other.rs": "" }, "proofs.rs").routes, [["lib.rs", 'cfg_attr(feature = "x", path = "other.rs")', "proofs"]]);
+  assert.deepEqual(routes({ "lib.rs": '#[path = "lib.rs"]\nmod again;\n#[cfg(w)] mod proofs;\n', "proofs.rs": harness }, "proofs.rs").routes, [["lib.rs", "cfg(w)", "proofs"]]);
+  assert.deepEqual(routes({ "lib.rs": 'mod proofs;\n#[path = "sys\\\\win.rs"] mod sys;\n', "proofs.rs": harness }, "proofs.rs").routes, [["lib.rs", "", "proofs"]]);
 
-  assert.equal(guards({ "lib.rs": '#![cfg(f)]\n#[cfg(x)] include!("sub/items.rs");\n', "sub/items.rs": "#[cfg(y)] mod q;\n" }, "sub/q.rs"), "cfg(f) cfg(x) cfg(y)");
-  assert.equal(guards({ "lib.rs": '#[cfg(m)] mod m {\n    include!("items.rs");\n}\n', "items.rs": "mod q;\n" }, "q.rs"), "cfg(m)");
-  assert.equal(guards({ "lib.rs": "mod a;\n", "a.rs": 'include!("sub/one.rs");\n', "sub/one.rs": 'include!("two.rs");\n', "sub/two.rs": "#[cfg(t)] mod q;\n" }, "sub/q.rs"), "cfg(t)");
-  assert.equal(guards({ "lib.rs": 'mod proofs;\nconst SOURCE: &str = include_str!("proofs.rs");\nfn f() { let _ = include_bytes!("proofs.rs"); }\n' }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": 'mod proofs;\ninclude!(concat!(env!("OUT_DIR"), "/bindings.rs"));\n' }, "proofs.rs"), "");
-  assert.match(failure({ "lib.rs": 'include!(concat!(env!("OUT_DIR"), "/proofs.rs"));\n' }, "proofs.rs"), /no module declaration that the record can read leads to this file .*lib\.rs:1: cannot read the path in 'include!\(concat!\(env!\("OUT_DIR"\), "\/proofs\.rs"\)\)'; write it as a string without escapes/);
+  const cargo = { "Cargo.toml": cargoToml, "src/lib.rs": "" };
+  assert.deepEqual(routes({ ...cargo, "tests/kani/main.rs": "#[cfg(t)] mod proofs;\n", "tests/kani/proofs.rs": harness }, "tests/kani/proofs.rs").routes, [["tests/kani/main.rs", "cfg(t)", "proofs"]]);
+  assert.deepEqual(routes({ ...cargo, "src/bin/tool/main.rs": "#[cfg(u)] mod proofs;\n", "src/bin/tool/proofs.rs": harness }, "src/bin/tool/proofs.rs").routes, [["src/bin/tool/main.rs", "cfg(u)", "proofs"]]);
+  const library = { "Cargo.toml": `${cargoToml}\n[lib]\npath = 'code/root.rs'\n`, "code/root.rs": "#[cfg(v)] mod proofs;\n", "code/proofs.rs": harness };
+  assert.deepEqual(routes(library, "code/proofs.rs").routes, [["code/root.rs", "cfg(v)", "proofs"]]);
+  assert.deepEqual(routes({ "Cargo.toml": "[workspace]\nmembers = []\n", "crates/foo/lib.rs": "#[cfg(w)] mod proofs;\n", "crates/foo/proofs.rs": harness }, "crates/foo/proofs.rs").routes, [["crates/foo/lib.rs", "cfg(w)", "proofs"]]);
+  // A lib.rs that main.rs also declares is both a crate root and a module; a main.rs below a module is only a module.
+  assert.deepEqual(routes({ ...cargo, "src/main.rs": `#[cfg(z)] #[path = "lib.rs"] mod lib;\nfn main() { let path = "lib.rs"; }\n`, "src/lib.rs": harness }, "src/lib.rs").routes, [["src/lib.rs", "", ""], ["src/main.rs", "cfg(z)", "lib"]]);
+  const below = { ...cargo, "src/lib.rs": '#[cfg(feature = "x")] mod a;\n', "src/a/mod.rs": "mod main;\n", "src/a/main.rs": "mod proofs;\n", "src/a/main/proofs.rs": harness };
+  assert.deepEqual(routes(below, "src/a/main/proofs.rs").routes, [["src/lib.rs", 'cfg(feature = "x")', "a::main::proofs"]]);
+});
 
-  const items = { "sub/items.rs": '#[path = "proofs.rs"] mod again;\n' };
+test("the route reader follows include! items outside macros and function bodies", () => {
+  const items = { "sub/items.rs": '#[path = "proofs.rs"] mod again;\n', "sub/proofs.rs": harness };
+  const twice = routes({ ...items, "lib.rs": '#[path = "sub/proofs.rs"] mod proofs;\ninclude!("sub/items.rs");\n' }, "sub/proofs.rs");
+  assert.deepEqual(twice, { routes: [["lib.rs", "", "again"], ["lib.rs", "", "proofs"]], label: "routes(../lib.rs: unguarded; ../lib.rs: unguarded)" });
+  const guarded = { ...items, "lib.rs": '#[path = "sub/proofs.rs"] mod proofs;\n#[cfg(feature = "slow")] include!("sub/items.rs");\n' };
+  assert.deepEqual(routes(guarded, "sub/proofs.rs").routes, [["lib.rs", "", "proofs"], ["lib.rs", 'cfg(feature = "slow")', "again"]]);
+  assert.deepEqual(routes({ "lib.rs": '#![cfg(f)]\n#[cfg(x)] include!("sub/items.rs");\n', "sub/items.rs": "#[cfg(y)] mod q;\n", "sub/q.rs": harness }, "sub/q.rs").routes, [["lib.rs", "cfg(f) cfg(x) cfg(y)", "q"]]);
+  // An included file's items sit in the modules around the include!.
+  assert.deepEqual(routes({ "lib.rs": '#[cfg(m)] mod m {\n    include!("items.rs");\n}\n', "items.rs": "mod q;\n", "q.rs": harness }, "q.rs").routes, [["lib.rs", "cfg(m)", "m::q"]]);
+  const chained = { "lib.rs": "mod a;\n", "a.rs": 'include!("sub/one.rs");\n', "sub/one.rs": 'include!("two.rs");\n', "sub/two.rs": "#[cfg(t)] mod q;\n", "sub/q.rs": harness };
+  assert.deepEqual(routes(chained, "sub/q.rs").routes, [["lib.rs", "cfg(t)", "a::q"]]);
+  // include_str!, include_bytes!, a path built from OUT_DIR, and an include! in a macro or function body lead nowhere.
+  const strings = { "lib.rs": 'mod proofs;\nconst SOURCE: &str = include_str!("proofs.rs");\nfn f() { let _ = include_bytes!("proofs.rs"); }\n', "proofs.rs": harness };
+  assert.deepEqual(routes(strings, "proofs.rs").routes, [["lib.rs", "", "proofs"]]);
+  assert.deepEqual(routes({ "lib.rs": 'mod proofs;\ninclude!(concat!(env!("OUT_DIR"), "/bindings.rs"));\n', "proofs.rs": harness }, "proofs.rs").routes, [["lib.rs", "", "proofs"]]);
   const wrapped = '#[path = "sub/proofs.rs"] mod proofs;\nmacro_rules! wrap { ($($t:tt)*) => { $($t)* } }\nwrap! { include!("sub/items.rs"); }\n';
-  assert.equal(guards({ "lib.rs": wrapped, ...items }, "sub/proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": '#[path = "sub/proofs.rs"] mod proofs;\n#[cfg(b)] include! { "sub/items.rs" }\n', ...items }, "sub/proofs.rs"), "routes(../lib.rs: unguarded; ../lib.rs: cfg(b))");
-
+  assert.deepEqual(routes({ ...items, "lib.rs": wrapped }, "sub/proofs.rs").routes, [["lib.rs", "", "proofs"]]);
   const manifest = 'include!(concat!(env!("CARGO_MANIFEST_DIR"), "/sub/items.rs"));\n';
-  const cargo = { "Cargo.toml": '[package]\nname = "p"\nversion = "0.1.0"\n', ...items };
-  const computed = recorded({ ...cargo, "lib.rs": `#[path = "sub/proofs.rs"] mod proofs;\n${manifest}` }, "sub/proofs.rs");
-  assert.equal(computed.result.status, 0, computed.result.stdout);
-  assert.equal(computed.guards(), "routes(../lib.rs: unguarded; ../lib.rs: unguarded)");
-  writeFileSync(join(computed.dir, "lib.rs"), `#[path = "sub/proofs.rs"] mod proofs;\n#[cfg(feature = "slow")]\n${manifest}`);
-  const guardedComputed = baseline(computed.dir, "compare", computed.record);
-  assert.equal(guardedComputed.status, 1, guardedComputed.stdout);
-  assert.deepEqual(lines(guardedComputed).slice(2, 4), ["    old: routes(../lib.rs: unguarded; ../lib.rs: unguarded)", '    new: routes(../lib.rs: unguarded; ../lib.rs: cfg(feature = "slow"))']);
-  assert.equal(guards({ "lib.rs": '#[path = "sub/proofs.rs"] mod proofs;\n#[cfg(c)] include!(std::concat!("sub/", "items.rs",));\n', ...items }, "sub/proofs.rs"), "routes(../lib.rs: unguarded; ../lib.rs: cfg(c))");
-  assert.equal(guards({ ...cargo, "lib.rs": `#[path = "sub/proofs.rs"] mod proofs;\nfn f() { ${manifest.trim()} }\n` }, "sub/proofs.rs"), "");
-  assert.match(failure({ ...items, "lib.rs": manifest }, "sub/proofs.rs"), /no module declaration that the record can read leads to this file .*lib\.rs:1: cannot read the path in 'include!\(concat!.*\)': no Cargo\.toml above the crate root sets env!\("CARGO_MANIFEST_DIR"\)/);
+  const cargo = { "Cargo.toml": cargoToml, ...items };
+  assert.deepEqual(routes({ ...cargo, "lib.rs": `#[path = "sub/proofs.rs"] mod proofs;\nfn f() { ${manifest.trim()} }\n` }, "sub/proofs.rs").routes, [["lib.rs", "", "proofs"]]);
+  // The brace form, a concat! of strings, and env!("CARGO_MANIFEST_DIR") lead to the file they name.
+  assert.equal(routes({ ...items, "lib.rs": '#[path = "sub/proofs.rs"] mod proofs;\n#[cfg(b)] include! { "sub/items.rs" }\n' }, "sub/proofs.rs").label, "routes(../lib.rs: unguarded; ../lib.rs: cfg(b))");
+  assert.equal(routes({ ...items, "lib.rs": '#[path = "sub/proofs.rs"] mod proofs;\n#[cfg(c)] include!(std::concat!("sub/", "items.rs",));\n' }, "sub/proofs.rs").label, "routes(../lib.rs: unguarded; ../lib.rs: cfg(c))");
+  assert.equal(routes({ ...cargo, "lib.rs": `#[path = "sub/proofs.rs"] mod proofs;\n#[cfg(feature = "slow")]\n${manifest}` }, "sub/proofs.rs").label, 'routes(../lib.rs: unguarded; ../lib.rs: cfg(feature = "slow"))');
   const workspace = {
-    "Cargo.toml": '[package]\nname = "p"\nversion = "0.1.0"\n\n[workspace]\nmembers = ["sub"]\n',
+    "Cargo.toml": `${cargoToml}\n[workspace]\nmembers = ["sub"]\n`,
     "sub/Cargo.toml": '[package]\nname = "q"\nversion = "0.1.0"\n',
     "sub/src/lib.rs": "",
     "src/lib.rs": 'mod proofs;\ninclude!("../sub/shared.rs");\n',
     "sub/shared.rs": 'include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/items.rs"));\n',
     "src/items.rs": '#[path = "proofs.rs"] mod again;\n',
+    "src/proofs.rs": harness,
   };
-  assert.equal(guards(workspace, "src/proofs.rs"), "routes(lib.rs: unguarded; lib.rs: unguarded)");
-  assert.equal(guards({ "Cargo.toml": cargo["Cargo.toml"], "src/lib.rs": '#[cfg(kani)] mod tests;\n#[cfg(feature = "codegen")]\ninclude!("../tests/generated.rs");\n' }, "src/tests.rs"), "");
+  assert.deepEqual(routes(workspace, "src/proofs.rs"), { routes: [["src/lib.rs", "", "again"], ["src/lib.rs", "", "proofs"]], label: "routes(lib.rs: unguarded; lib.rs: unguarded)" });
+  const generated = { "Cargo.toml": cargoToml, "src/lib.rs": '#[cfg(kani)] mod tests;\n#[cfg(feature = "codegen")]\ninclude!("../tests/generated.rs");\n', "src/tests.rs": harness };
+  assert.deepEqual(routes(generated, "src/tests.rs").routes, [["src/lib.rs", "", "tests"]]);
+});
+
+test("the record labels several routes to a Kani harness file by crate root, sorted, with unguarded for a route without guards", () => {
+  const files = (lib, main) => ({ "Cargo.toml": cargoToml, "src/lib.rs": lib, "src/main.rs": `${main}fn main() {}\n`, "src/proofs.rs": harness });
+  const label = (lib, main) => routes(files(lib, main), "src/proofs.rs").label;
+  assert.equal(label("#[cfg(x)] mod proofs;\n", '#[cfg(feature = "slow")]\nmod proofs;\n'), 'routes(lib.rs: cfg(x); main.rs: cfg(feature = "slow"))');
+  assert.equal(label('#[cfg(feature = "slow")]\nmod proofs;\n', "mod proofs;\n"), 'routes(lib.rs: cfg(feature = "slow"); main.rs: unguarded)');
+  assert.equal(label("mod proofs;\n", "mod proofs;\n"), "routes(lib.rs: unguarded; main.rs: unguarded)");
+  assert.equal(label("mod proofs;\n", ""), "");
+  // The label sorts routes by their crate roots' paths relative to the file, so a root in a directory above it comes first.
+  const replaced = routes({ ...files("", '#[cfg(feature = "slow")]\nmod proofs;\n'), "tests/t.rs": '#[path = "../src/proofs.rs"]\nmod proofs;\n' }, "src/proofs.rs");
+  assert.deepEqual(replaced, { routes: [["src/main.rs", 'cfg(feature = "slow")', "proofs"], ["tests/t.rs", "", "proofs"]], label: 'routes(../tests/t.rs: unguarded; main.rs: cfg(feature = "slow"))' });
+  const root = routes(files("mod proofs;\n", '#[cfg(z)] #[path = "lib.rs"] mod lib;\n'), "src/proofs.rs");
+  assert.deepEqual(root, { routes: [["src/lib.rs", "", "proofs"], ["src/main.rs", "cfg(z)", "lib::proofs"]], label: "routes(lib.rs: unguarded; main.rs: cfg(z))" });
+});
+
+test("the route reader fails for a file that no route it reads reaches, and names what it could not read", () => {
+  const unreached = "no module declaration that the record can read leads to this file from a crate root; declare it with `mod <name>;` or `#[path = \"...\"]` outside macros and function bodies, in a file that a crate root reaches";
+  assert.deepEqual(routes({ "lib.rs": "", "stray.rs": harness }, "stray.rs"), { error: `<crate>/stray.rs: ${unreached}` });
+  assert.deepEqual(routes({ "lib.rs": 'fn f() {\n    #[path = "checks.rs"] mod proofs;\n}\n', "checks.rs": harness }, "checks.rs"), { error: `<crate>/checks.rs: ${unreached}` });
+  assert.match(routes({ "lib.rs": "mod proofs;\nfn open() {\n", "proofs.rs": harness }, "proofs.rs").error, /^<crate>\/proofs\.rs: no module declaration .*; <crate>\/lib\.rs: unbalanced \{/);
+  assert.equal(routes({ "lib.rs": 'include!(concat!(env!("OUT_DIR"), "/proofs.rs"));\n', "proofs.rs": harness }, "proofs.rs").error,
+    `<crate>/proofs.rs: ${unreached}; <crate>/lib.rs:1: cannot read the path in 'include!(concat!(env!("OUT_DIR"), "/proofs.rs"))'; write it as a string without escapes, or as concat! of such strings and env!("CARGO_MANIFEST_DIR")`);
+  const manifest = { "lib.rs": 'include!(concat!(env!("CARGO_MANIFEST_DIR"), "/sub/items.rs"));\n', "sub/items.rs": '#[path = "proofs.rs"] mod again;\n', "sub/proofs.rs": harness };
+  assert.equal(routes(manifest, "sub/proofs.rs").error,
+    `<crate>/sub/proofs.rs: ${unreached}; <crate>/lib.rs:1: cannot read the path in 'include!(concat!(env!("CARGO_MANIFEST_DIR"), "/sub/items.rs"))': no Cargo.toml above the crate root sets env!("CARGO_MANIFEST_DIR"), so the record cannot tell which file it reads`);
 });
 
 test("only a cfg_attr whose own attribute list applies cfg guards a Kani harness", () => {
