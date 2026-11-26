@@ -387,12 +387,12 @@ def rust_functions(mask):
     """
     functions, modules, opaque, declarations, includes, counts = [], [], [], [], [], {}
 
-    def add_include(boundary, header, stop, in_function):
-        if not in_function and (include := INCLUDE.search(header)):
+    def add_include(boundary, header, stop, in_body):
+        if not in_body and (include := INCLUDE.search(header)):
             semicolon = re.compile(r"\s*;").match(mask, stop)
             includes.append(RustFunction("include", boundary, boundary + include.start(), semicolon.end() - 1 if semicolon else stop - 1, stop))
 
-    def walk(start, end, namespace=(), in_function=False):
+    def walk(start, end, namespace=(), in_function=False, in_body=False):
         i, boundary, item = start, start, None
         while i < end:
             if match := RUST_ITEM.match(mask, i):
@@ -403,7 +403,7 @@ def rust_functions(mask):
                 header = mask[boundary:i].rstrip()
                 if header.endswith("!"):
                     opaque.append((i, stop))
-                    add_include(boundary, header, stop, in_function)
+                    add_include(boundary, header, stop, in_body)
                 i = stop
             elif mask[i] == "{":
                 stop = after_closing(mask, i)
@@ -419,17 +419,17 @@ def rust_functions(mask):
                         functions.append(RustFunction(owner + suffix, boundary, keyword, i, stop))
                     else:
                         modules.append(RustFunction("::".join(qualified), boundary, keyword, i, stop))
-                    walk(i + 1, stop - 1, qualified, kind == "fn")
+                    walk(i + 1, stop - 1, qualified, kind == "fn", in_body or kind == "fn")
                 elif in_function and not macro and not re.search(r"\b(?:impl|trait|struct|enum|union|extern|macro)\b", header):
-                    walk(i + 1, stop - 1, namespace, True)
+                    walk(i + 1, stop - 1, namespace, True, True)
                 else:
                     opaque.append((i, stop))
-                    add_include(boundary, header, stop, in_function)
+                    add_include(boundary, header, stop, in_body)
                 i = boundary = stop
                 item = None
             else:
                 if mask[i] == ";":
-                    if item and item[0] == "mod" and not in_function:
+                    if item and item[0] == "mod" and not in_body:
                         declarations.append(RustFunction("::".join((*namespace, item[1])), boundary, item[2], i, i + 1))
                     boundary, item = i + 1, None
                 i += 1
@@ -800,6 +800,20 @@ def item_path(name):
     return "::".join(part.removeprefix("r#") for part in name.split("::") if not ANONYMOUS.fullmatch(part))
 
 
+def route_owner(name, modules, owners):
+    """Return the owner in owners, keyed by item_path, that Kani's harness name gives under one of modules, or None.
+
+    The name must start with the module path itself. Anonymous segments are dropped only after it, since no route
+    that the record reads runs through a closure or a `const _` block.
+    """
+    parts = [part.removeprefix("r#") for part in name.split("::")]
+    for module in modules:
+        prefix = [part.removeprefix("r#") for part in module.split("::")] if module else []
+        if parts[:len(prefix)] == prefix and (owner := owners.get(item_path("::".join(parts[len(prefix):])))):
+            return owner
+    return None
+
+
 def compiled_problems(path, surface, recorded=None):
     """Return the lines on which the harnesses that Kani compiles from path disagree with surface and recorded, and
     surface's harnesses that it compiles, as `harness <owner>` items, or None for them when no Cargo package holds
@@ -814,13 +828,14 @@ def compiled_problems(path, surface, recorded=None):
     package = next((folder for folder in path.parents if (folder / "Cargo.toml").is_file()), None)
     if package is None:
         return [f"  not compiled {item}" for item in recorded or ()], None
-    names = {item_path(harness.name) for harness in compiled_in(package) if harness.source == path}
+    names = {harness.name for harness in compiled_in(package) if harness.source == path}
     _, modules = declaration_guards(path)
     owners = {re.sub(r"\[\d+\]$", "", KANI_KEY.fullmatch(item)[2]) for item in surface if item.startswith("harness ")}
-    expected = {item_path("::".join(filter(None, (module, owner)))): owner for module in modules for owner in owners}
+    found = {name: route_owner(name, modules, {item_path(owner): owner for owner in owners}) for name in names}
     lines = [f"  FAIL Kani compiles {name} from this file, but no route that the record reads gives that name; declare "
-             "the module with `mod <name>;` or `#[path = \"...\"]` outside macros and function bodies" for name in sorted(names - expected.keys())]
-    compiled = sorted({f"harness {expected[name]}" for name in names & expected.keys()})
+             "the module with `mod <name>;` or `#[path = \"...\"]` outside macros and function bodies"
+             for name, owner in sorted(found.items()) if owner is None]
+    compiled = sorted({f"harness {owner}" for owner in found.values() if owner is not None})
     lines += [f"  not compiled {item}" for item in sorted(set(recorded or ()) - set(compiled))]
     return lines, compiled
 
@@ -925,8 +940,8 @@ def move(record_path, old_file, new_file, module):
         if overlap := surface.keys() & models[new]["surface"].keys():
             raise ValueError(f"{new} already records {', '.join(sorted(overlap))}")
         surface = {**models[new]["surface"], **surface}
-        if "compiled" in models[new]:
-            compiled = [*models[new]["compiled"], *(compiled or [])]
+        # The merged entry holds Kani's list only when both entries were checked against Kani at record.
+        compiled = [*models[new]["compiled"], *compiled] if "compiled" in models[new] and compiled is not None else None
     models[new] = {"kind": kind, "digest": digest(surface), "surface": surface}
     if compiled is not None:
         models[new]["compiled"] = sorted(compiled)
@@ -965,7 +980,11 @@ def compare(record_path):
                 lines = differences(entry["kind"], entry["surface"], surface)
                 if entry["kind"] == "kani":
                     try:
-                        lines += compiled_problems(Path(model), surface, entry.get("compiled"))[0]
+                        problems, names = compiled_problems(Path(model), surface, entry.get("compiled"))
+                        lines += problems
+                        if names is not None and "compiled" not in entry:
+                            lines.append("  not checked against Kani at record, so compare cannot see a harness that "
+                                         "stopped compiling on a route that the record does not read")
                     except ValueError as error:
                         lines.append(f"  FAIL {error}")
         except (OSError, ValueError, KeyError, TypeError) as error:

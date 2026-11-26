@@ -644,6 +644,24 @@ test("each harness that Kani compiles from a recorded file must be on a route th
   const failed = baseline(missing.dir, "compare", missing.record);
   assert.equal(failed.status, 1);
   assert.match(lines(failed)[1], /^ {2}FAIL cannot ask Kani which harnesses it compiles in .*UNAVAILABLE Kani/);
+  // With Kani at compare only, a route that the record does not read could have been switched off since record.
+  const notChecked = "  not checked against Kani at record, so compare cannot see a harness that stopped compiling on a route that the record does not read";
+  compiles(missing.dir, "src/proofs.rs", ["readable::a"]);
+  assert.deepEqual(lines(baseline(missing.dir, "compare", missing.record)), [`CHANGED ${missing.proofs}`, notChecked, "SUMMARY 0 unchanged, 1 changed"]);
+  // move onto a file that was checked against Kani keeps the merged entry unchecked.
+  const other = join(missing.dir, "src/other.rs");
+  writeFileSync(other, "#[kani::proof]\nfn b() {}\n");
+  writeFileSync(join(missing.dir, "src/lib.rs"), '#[path = "proofs.rs"] mod readable;\nmod other;\n');
+  compiles(missing.dir, "src/other.rs", ["other::b"]);
+  assert.equal(baseline(missing.dir, "record", missing.record, other).status, 0);
+  assert.deepEqual(JSON.parse(readFileSync(missing.record, "utf8")).models[other].compiled, ["harness b"]);
+  writeFileSync(other, "#[kani::proof]\nfn b() {}\n#[kani::proof]\nfn a() {}\n");
+  rmSync(missing.proofs);
+  writeFileSync(join(missing.dir, "src/lib.rs"), "mod other;\n");
+  assert.equal(baseline(missing.dir, "move", missing.record, missing.proofs, other).status, 0);
+  assert.equal(JSON.parse(readFileSync(missing.record, "utf8")).models[other].compiled, undefined);
+  compiles(missing.dir, "src/other.rs", ["other::a", "other::b"]);
+  assert.deepEqual(lines(baseline(missing.dir, "compare", missing.record)), [`CHANGED ${other}`, notChecked, "SUMMARY 0 unchanged, 1 changed"]);
 
   // A closure or a const _ block adds an anonymous segment to Kani's name, which is not a route.
   const closure = crate(["readable::f::{closure#0}::g", "readable::f::_::h"]);

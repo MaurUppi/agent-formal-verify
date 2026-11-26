@@ -199,6 +199,16 @@ HIDDEN_ROUTES = [
     ("proofs::check", "proofs.rs", {
         "lib.rs": '#[path = "proofs.rs"] mod readable;\n'
                   "macro_rules! call { ($mac:ident, $m:ident) => { builders::$mac!($m); }; }\ncall!(declare, proofs);\n"}),
+    # A route under a function body or a const _ block, which the record does not read, keeps its own name.
+    ("f::m::again::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\nfn f() {\n    mod m {\n        #[path = "../proofs.rs"]\n        mod again;\n    }\n}\n',
+        # rustc resolves src/m/../proofs.rs only when src/m exists.
+        "m/.keep": ""}),
+    ("f::m::again::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\nfn f() {\n    mod m { include!("sub/items.rs"); }\n}\n',
+        "sub/items.rs": '#[path = "../proofs.rs"]\nmod again;\n'}),
+    ("_::readable::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\nconst _: () = {\n    #[path = "proofs.rs"]\n    mod readable;\n};\n'}),
 ]
 # Each crate invokes a macro that rustc resolves to a local one that declares no module, through a glob import, a
 # module path, and a definition that shadows one passing the name to the builders crate. Each records.
