@@ -31,6 +31,9 @@ function models() {
 // Kani is the fake that a test installs at dir/kani, or absent, whatever this machine has installed.
 const baseline = (dir, ...args) => run(dir, "baseline.py", args, { KANI_HOME: join(dir, "kani") });
 const lines = (result) => result.stdout.split("\n").filter(Boolean);
+// Install the fake Kani at dir/kani, compiling each of names from target.
+const compiles = (dir, target, names) =>
+  installKani(dir, { harnesses: Object.fromEntries(names.map((name) => [name, 1])), harnessSources: Object.fromEntries(names.map((name) => [name, target])) });
 
 function edit(path, from, to) {
   const text = readFileSync(path, "utf8");
@@ -559,7 +562,7 @@ test("removing or guarding one of several routes to a Kani harness file is chang
       mkdirSync(join(dir, name, ".."), { recursive: true });
       writeFileSync(join(dir, name), text);
     }
-    installKani(dir, { harnesses: Object.fromEntries(compiled.map((name) => [name, 1])), harnessSources: Object.fromEntries(compiled.map((name) => [name, target])) });
+    compiles(dir, target, compiled);
     const record = join(dir, "record.json");
     const proofs = join(dir, target);
     assert.equal(baseline(dir, "record", record, proofs).status, 0);
@@ -612,10 +615,9 @@ test("each harness that Kani compiles from a recorded file must be on a route th
       mkdirSync(join(dir, name, ".."), { recursive: true });
       writeFileSync(join(dir, name), text);
     }
-    kani(dir, compiled);
+    compiles(dir, "src/proofs.rs", compiled);
     return { dir, record: join(dir, "record.json"), proofs: join(dir, "src/proofs.rs") };
   };
-  const kani = (dir, compiled) => installKani(dir, { harnesses: Object.fromEntries(compiled.map((name) => [name, 1])), harnessSources: Object.fromEntries(compiled.map((name) => [name, "src/proofs.rs"])) });
   const hiddenRoute = "Kani compiles proofs::a from this file, but no route that the record reads gives that name";
 
   // A macro such as builders::declare!(proofs) compiles the file a second time, as proofs, which the record cannot read.
@@ -628,12 +630,12 @@ test("each harness that Kani compiles from a recorded file must be on a route th
   assert.deepEqual(lines(baseline(readable.dir, "record", readable.record, readable.proofs)).slice(1), []);
   assert.deepEqual(JSON.parse(readFileSync(readable.record, "utf8")).models[readable.proofs].compiled, ["readable::a"]);
   assert.deepEqual(lines(baseline(readable.dir, "compare", readable.record)), [`UNCHANGED ${readable.proofs}`, "SUMMARY 1 unchanged, 0 changed"]);
-  kani(readable.dir, ["readable::a", "proofs::a"]);
+  compiles(readable.dir, "src/proofs.rs", ["readable::a", "proofs::a"]);
   const added = lines(baseline(readable.dir, "compare", readable.record));
   assert.equal(added[0], `CHANGED ${readable.proofs}`);
   assert.ok(added[1].startsWith(`  FAIL ${hiddenRoute}`), added[1]);
   // A cfg that the text does not show, such as a default feature removed from Cargo.toml, switches the harness off.
-  kani(readable.dir, []);
+  compiles(readable.dir, "src/proofs.rs", []);
   assert.deepEqual(lines(baseline(readable.dir, "compare", readable.record)), [`CHANGED ${readable.proofs}`, "  not compiled readable::a", "SUMMARY 0 unchanged, 1 changed"]);
   rmSync(join(readable.dir, "Cargo.toml"));
   assert.deepEqual(lines(baseline(readable.dir, "compare", readable.record)), [`CHANGED ${readable.proofs}`, "  not compiled readable::a", "SUMMARY 0 unchanged, 1 changed"]);

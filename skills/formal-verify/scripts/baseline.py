@@ -1215,12 +1215,13 @@ def declaration_guards(path):
                       for start, route, module in routes(declarer, visiting | {declarer})]
         return found
 
-    found = routes(path, {path})
-    modules = {module.replace("r#", "") for _, _, module in found}
-    labelled = sorted((os.path.relpath(root, path.parent), guards) for root, guards, _ in found)
-    if len(labelled) == 1:
-        return labelled[0][1], modules
-    return "routes({})".format("; ".join(f"{root}: {guards or 'unguarded'}" for root, guards in labelled)), modules
+    traced = routes(path, {path})
+    modules = {module for _, _, module in traced}
+    found = sorted((os.path.relpath(root, path.parent), guards) for root, guards, _ in traced)
+    if len(found) == 1:
+        return found[0][1], modules
+    labelled = "; ".join(f"{root}: {guards or 'unguarded'}" for root, guards in found)
+    return f"routes({labelled})", modules
 
 
 def kani_surface(path):
@@ -1270,14 +1271,14 @@ def checker():
 
 @functools.cache
 def compiled_in(package):
-    """Return each harness that Kani compiles in the Cargo package at package, as (name, source file).
+    """Return each harness that Kani compiles in the Cargo package at package.
 
     Raises:
         ValueError: Kani is not installed, or cannot compile the package.
     """
     try:
         with tempfile.TemporaryDirectory(prefix="baseline-kani-") as work:
-            return tuple((harness.name.replace("r#", ""), harness.source) for harness in kani.compiled(package, Path(work), checker()))
+            return tuple(kani.compiled(package, Path(work), checker()))
     except (kani.CheckError, runner.Unavailable) as error:
         raise ValueError(f"cannot ask Kani which harnesses it compiles in {package}: {error}") from error
 
@@ -1296,10 +1297,10 @@ def compiled_problems(path, surface, recorded=None):
     package = next((folder for folder in path.parents if (folder / "Cargo.toml").is_file()), None)
     if package is None:
         return [f"  not compiled {name}" for name in recorded or ()], None
-    names = {name for name, source in compiled_in(package) if source == path}
+    names = {harness.name.replace("r#", "") for harness in compiled_in(package) if harness.source == path}
     _, modules = declaration_guards(path)
-    owners = {re.sub(r"\[\d+\]$", "", KANI_KEY.fullmatch(item)[2]).replace("r#", "") for item in surface if item.startswith("harness ")}
-    expected = {"::".join(filter(None, (module, owner))) for module in modules for owner in owners}
+    owners = {re.sub(r"\[\d+\]$", "", KANI_KEY.fullmatch(item)[2]) for item in surface if item.startswith("harness ")}
+    expected = {"::".join(filter(None, (module, owner))).replace("r#", "") for module in modules for owner in owners}
     lines = [f"  FAIL Kani compiles {name} from this file, but no route that the record reads gives that name; declare "
              "the module with `mod <name>;` or `#[path = \"...\"]` outside macros and function bodies" for name in sorted(names - expected)]
     lines += [f"  not compiled {name}" for name in sorted(set(recorded or ()) - names)]
@@ -1321,7 +1322,8 @@ def read_record(path):
     for model, entry in models.items():
         if not isinstance(entry, dict) or entry.get("kind") not in SURFACES or not isinstance(entry.get("surface"), dict):
             raise ValueError(f"{path}: malformed entry for {model}")
-        if not isinstance(entry.get("compiled", []), list) or not all(isinstance(name, str) for name in entry.get("compiled", [])):
+        compiled = entry.get("compiled", [])
+        if not isinstance(compiled, list) or not all(isinstance(name, str) for name in compiled):
             raise ValueError(f"{path}: malformed entry for {model}")
     return models
 
