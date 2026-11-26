@@ -532,9 +532,7 @@ def string_value(literal):
 
 class RustFile(NamedTuple):
     source: RustSource
-    functions: list
     modules: list
-    opaque: list
     declarations: list
     includes: list
 
@@ -545,7 +543,8 @@ PARSED = {}
 def parse_rust(path):
     if path not in PARSED:
         source = rust_masks(path.read_text(encoding="utf-8"))
-        PARSED[path] = RustFile(source, *rust_functions(source.without_comments_or_strings))
+        _, modules, _, declarations, includes = rust_functions(source.without_comments_or_strings)
+        PARSED[path] = RustFile(source, modules, declarations, includes)
     return PARSED[path]
 
 
