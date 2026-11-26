@@ -36,7 +36,6 @@ OLD to sit under NEW. Exit codes: 0 unchanged, 1 changed or a record or model
 file that fails to parse, 2 usage error.
 """
 import argparse
-import bisect
 import functools
 import hashlib
 import json
@@ -554,12 +553,11 @@ def enclosing_modules(parsed, item):
     return sorted((module for module in parsed.modules if module.start <= item.start < module.end), key=lambda module: module.start)
 
 
-def module_files(file, owner, parsed, declaration, inner=()):
+def module_files(file, owner, parsed, declaration):
     """Yield each file that an out-of-line `mod` declaration in file may load, by rustc's rules, and whether that
-    file owns its directory, as a crate root, a mod.rs or a `#[path]` file does. inner holds the inline modules
-    around the declaration inside a macro body, outermost first."""
+    file owns its directory, as a crate root, a mod.rs or a `#[path]` file does."""
     states = [(file.parent, file.parent if owner else file.parent / file.stem)]
-    for module in enclosing_modules(parsed, declaration) + list(inner):
+    for module in enclosing_modules(parsed, declaration):
         paths, conditional = module_paths(parsed.source, module, file)
         name = module.name.rsplit("::", 1)[-1].removeprefix("r#")
         states = [(child, child) for directory, prefix in states for child in ([] if paths else [prefix / name]) + [directory / path for path in paths + conditional]]
@@ -639,31 +637,29 @@ TREES = {}
 
 def module_tree(roots):
     """Return the module declarations that lead to each file the crate roots reach, as {file: {(declarer,
-    declaration)}}, the (message, text) of each reached file or declaration that could not be read, and the
-    package directory of the first crate root that reaches each file, or None outside a Cargo package.
+    declaration)}}, and the message for each reached file or declaration that could not be read.
 
     An `include!("...")` item outside function bodies leads to the file it names, relative to the including file,
     which declares modules as a file that owns its directory does, whatever inline modules hold the include.
     """
     if roots not in TREES:
-        edges, broken, seen, packages = {}, [], set(), {}
+        edges, broken, seen = {}, [], set()
         work = [(root, True, next((folder for folder in root.parents if (folder / "Cargo.toml").is_file()), None)) for root in roots]
         while work:
             file, owner, package = work.pop()
             if (file, owner, package) in seen:
                 continue
             seen.add((file, owner, package))
-            packages.setdefault(file, package)
             try:
                 parsed = parse_rust(file)
             except ValueError as error:
-                broken.append((f"{file}: {error}", file.read_text(encoding="utf-8", errors="replace")))
+                broken.append(f"{file}: {error}")
                 continue
             for declaration in parsed.declarations:
                 try:
                     targets = list(module_files(file, owner, parsed, declaration))
                 except ValueError as error:
-                    broken.append((str(error), parsed.source.uncommented[declaration.start:declaration.end]))
+                    broken.append(str(error))
                     continue
                 for target, owns in targets:
                     if target.is_file():
@@ -677,485 +673,16 @@ def module_tree(roots):
                 try:
                     target = include_path(invocation.uncommented[invocation.without_comments_or_strings.index("!") + 1:].strip()[1:-1], file, package)
                 except ValueError as error:
-                    broken.append((f"{file}:{line}: cannot read the path in '{shown}': {error}", None))
+                    broken.append(f"{file}:{line}: cannot read the path in '{shown}': {error}")
                     continue
                 if target is None:
-                    broken.append((f"{file}:{line}: cannot read the path in '{shown}'; write it as a string without escapes, or as concat! of such strings and env!(\"CARGO_MANIFEST_DIR\")", invocation.uncommented))
+                    broken.append(f"{file}:{line}: cannot read the path in '{shown}'; write it as a string without escapes, or as concat! of such strings and env!(\"CARGO_MANIFEST_DIR\")")
                 elif target.is_file():
                     target = target.resolve()
                     edges.setdefault(target, set()).add((file, include))
                     work.append((target, True, package))
-        TREES[roots] = edges, broken, packages
+        TREES[roots] = edges, broken
     return TREES[roots]
-
-
-HIDDEN_DECLARATION = re.compile(r"\bmod\s+(?:r#)?(\w+)\s*;")
-HIDDEN_PATH = re.compile(r"[\[,]\s*path\s*=\s*")
-HIDDEN_MODULE = re.compile(r"\bmod\s+((?:r#)?\w+)\s*\{")
-INVOKED = re.compile(r"(?P<path>(?:::\s*)?(?:\w+\s*::\s*)*)(?P<name>\w+)\s*!\s*$")
-LOCAL_PATH = re.compile(r"(?:(?:crate|self|super)\s*::\s*(?:\w+\s*::\s*)*)?")
-DEFINED = re.compile(r"\bmacro_rules\s*!\s*(\w+)\s*$")
-ITEM_INVOCATION = re.compile(r"(?:\$(?=crate\b))?(?P<path>(?:::\s*)?(?:\w+\s*::\s*)*)(?P<name>\w+)\s*!\s*[(\[{]")
-INLINE_MODULE = re.compile(r"\bmod\s+\$?\w+\s*$")
-TOKEN = re.compile(r"\$?\w+|.", re.DOTALL)
-OPENER = re.compile(r"[(\[{]")
-ARM = re.compile(r"\s*=>\s*[(\[{]")
-NAME_FRAGMENT = re.compile(r"\$(\w+)\s*:\s*(?:ident|tt)\b")
-INCLUDES = ("include", "include_str", "include_bytes")
-INCLUDE_CALL = re.compile(r"\binclude\s*!\s*[(\[{]")
-HIDDEN = "a module declaration inside a macro or function body may load"
-BUILT = "a macro invocation may build a module declaration that loads"
-UNREAD = "an invocation of a macro that the record cannot read may build a module declaration that loads"
-INCLUDED = "an include! inside a macro or function body reads a file that may load"
-ATTRIBUTED = "an attribute macro that the record cannot read may build a module declaration that loads"
-ATTRIBUTE_PATH = re.compile(r"\s*((?:::\s*)?(?:(?:r#)?\w+\s*::\s*)*(?:r#)?\w+)\s*")
-SCRIPT_HEAD = re.compile(r"﻿?(?:#!(?!\s*\[)[^\n]*)?")
-INERT_TOOLS = {"rustfmt", "clippy", "diagnostic", "rustdoc", "kani", "kanitool", "miri", "rust_analyzer"}
-ITEM_REWRITERS = {"tracing::instrument", "instrument", "async_trait::async_trait", "async_trait", "tokio::main", "tokio::test"}
-BUILTIN_ATTRIBUTES = {
-    "cfg", "test", "ignore", "should_panic", "bench", "derive", "automatically_derived", "macro_export", "macro_use", "proc_macro",
-    "proc_macro_derive", "proc_macro_attribute", "allow", "warn", "deny", "forbid", "expect", "deprecated", "must_use", "link",
-    "link_name", "link_ordinal", "link_section", "no_link", "no_mangle", "used", "crate_name", "crate_type", "no_builtins", "no_main",
-    "no_std", "no_implicit_prelude", "path", "recursion_limit", "type_length_limit", "panic_handler", "global_allocator",
-    "windows_subsystem", "feature", "non_exhaustive", "inline", "cold", "track_caller", "instruction_set", "target_feature", "doc",
-    "repr", "export_name", "debugger_visualizer", "collapse_debuginfo", "naked", "unsafe", "coverage", "optimize", "register_tool",
-    "allow_internal_unstable", "allow_internal_unsafe", "test_runner", "thread_local", "ffi_pure", "ffi_const", "may_dangle",
-    "patchable_function_entry", "sanitize", "const_trait", "marker", "default_lib_allocator", "needs_allocator", "compiler_builtins",
-    "profiler_runtime", "omit_gdb_pretty_printer_section", "prelude_import", "reexport_test_harness_main", "cfg_accessible", "cfg_eval",
-    "cfg_select", "define_opaque", "derive_const", "eii", "eii_declaration", "unsafe_eii", "autodiff_forward", "autodiff_reverse",
-    "alloc_error_handler", "contracts_requires", "contracts_ensures", "no_sanitize",
-}
-
-
-def module_builders(parsed):
-    """Return the names of the `macro_rules!` macros in a parsed file whose bodies declare `mod $name;`."""
-    mask = parsed.source.without_comments_or_strings
-    return {defined[1] for start, end in parsed.opaque if (defined := DEFINED.search(mask, max(0, start - 100), start)) and re.search(r"\bmod\s+\$\w+\s*;", mask[start:end])}
-
-
-def transcribers(mask, start, end):
-    """Yield the names of the `ident` and `tt` metavariables of each arm of the `macro_rules!` body mask[start:end],
-    with the start and end of the tokens inside the arm's transcriber."""
-    i = start
-    while (matcher := OPENER.search(mask, i, end)) and (arrow := ARM.match(mask, after_closing(mask, matcher.start()))):
-        close = after_closing(mask, arrow.end() - 1)
-        yield set(NAME_FRAGMENT.findall(mask, matcher.start(), arrow.start())), arrow.end(), close - 1
-        i = close
-
-
-def item_invocations(mask, start, end, macros, visible):
-    """Yield the match of each macro invocation at an item position in mask[start:end], with the tokens inside its
-    delimiters: one that starts the tokens or follows a `;`, a `}` or an attribute, and that braces delimit or a `;`
-    follows. So does one inside a `$(...)` repetition, a `mod name {...}` body or an invocation there of one of the
-    macros that `readable` takes the visible names to reach, but not one inside another group, such as a block or a
-    function body."""
-    i, item = start, True
-    while i < end:
-        if mask[i].isspace():
-            i += 1
-        elif item and (invocation := ITEM_INVOCATION.match(mask, i, end)):
-            close = after_closing(mask, invocation.end() - 1)
-            braced = mask[invocation.end() - 1] == "{"
-            if braced or mask[close:end].lstrip().startswith(";"):
-                yield invocation, mask[invocation.end():close - 1]
-                if readable(invocation, macros, visible):
-                    yield from item_invocations(mask, invocation.end(), close - 1, macros, visible)
-            i, item = close, braced
-        elif attribute := ATTRIBUTE.match(mask, i, end):
-            i = after_closing(mask, attribute.end() - 1)
-        elif mask.startswith("$(", i):
-            close = after_closing(mask, i + 1)
-            yield from item_invocations(mask, i + 2, close - 1, macros, visible)
-            i, item = close, True
-        elif mask[i] in "([{":
-            close = after_closing(mask, i)
-            if mask[i] == "{" and INLINE_MODULE.search(mask, start, i):
-                yield from item_invocations(mask, i + 1, close - 1, macros, visible)
-            i, item = close, mask[i] == "{"
-        else:
-            item = mask[i] == ";" or item and mask[i] in "*+?"
-            i = TOKEN.match(mask, i).end()
-
-
-class Macros(NamedTuple):
-    """The `macro_rules!` definitions in the reached files, each map from a macro's name to the (file, offset) keys
-    of its definitions: every definition, and those whose invocations the record can read, with the keys of the
-    callbacks, those whose transcribers invoke a macro through a metavariable, such as `$mac!(...)`."""
-    every: dict
-    readable: dict
-    callbacks: set
-
-
-def readable(invoked, macros, visible):
-    """Return whether an invocation calls a macro that the record can read: one that a path inside the crate names,
-    or a bare name, and every definition of the name that the invocation may reach is readable.
-
-    A path reaches every definition of the name, and a bare name those in visible, which maps a name to the keys of
-    its definitions in scope at the invocation.
-    """
-    name = invoked["name"]
-    if not LOCAL_PATH.fullmatch(invoked["path"]):
-        return False
-    found = (macros.every if invoked["path"] else visible).get(name)
-    return bool(found) and found <= macros.readable.get(name, set())
-
-
-def macro_definitions(parsed):
-    """Yield the start and end of the body of each `macro_rules!` macro defined in a parsed file, with its name."""
-    mask = parsed.source.without_comments_or_strings
-    for start, end in parsed.opaque:
-        if defined := DEFINED.search(mask, max(0, start - 100), start):
-            yield start, end, defined[1]
-
-
-def readable_macros(parsed_files, builders):
-    """Return the `macro_rules!` definitions in the parsed files and those whose invocations the record can read:
-    those whose transcribers pass no `ident` or `tt` metavariable of their arm to an invocation at an item position
-    of one of the builders or of a macro that the record cannot read, or to an attribute macro on an item there. A
-    bare name in a transcriber resolves where the macro is invoked, so it may reach every definition of the name."""
-    bodies = [(parsed.source.without_comments_or_strings, start, end, name, (file, start)) for file, parsed in parsed_files for start, end, name in macro_definitions(parsed)]
-    every = {}
-    for *_, name, key in bodies:
-        every.setdefault(name, set()).add(key)
-    callbacks = {key for mask, start, end, _, key in bodies if any(CALLBACK.search(mask, begin, stop) for _, begin, stop in transcribers(mask, start + 1, end - 1))}
-    macros = Macros(every, {name: set(keys) for name, keys in every.items()}, callbacks)
-
-    def forwards(mask, begin, stop, variables):
-        passed = rf"\$(?:{'|'.join(variables)})\b"
-        return any((invocation["name"] in builders or not readable(invocation, macros, every)) and passes_name(tokens, passed)
-                   for invocation, tokens in item_invocations(mask, begin, stop, macros, every)) or any(
-            passes_name(arguments, passed) for _, opened, close, run in item_attributes(mask, begin, stop) for arguments in macro_arguments(mask[opened:close - 1], derived(mask, run)))
-
-    while forwarding := {(name, key) for mask, start, end, name, key in bodies if key in macros.readable[name] and any(
-            forwards(mask, begin, stop, variables) for variables, begin, stop in transcribers(mask, start + 1, end - 1) if variables)}:
-        for name, key in forwarding:
-            macros.readable[name].discard(key)
-    return macros
-
-
-def inner_attributes(source, start):
-    """Yield the contents of each inner attribute at offset start of source."""
-    mask = source.without_comments_or_strings
-    while attribute := INNER_ATTRIBUTE.match(mask, start):
-        opener = attribute.end() - 1
-        start = after_closing(mask, opener)
-        yield rust_masks(source.uncommented[opener + 1:start - 1])
-
-
-def macro_use(attributes):
-    """Return whether one of the attributes is `macro_use`."""
-    return any(re.sub(r"\s+", "", attribute.without_comments_or_strings) == "macro_use" for attribute in attributes)
-
-
-def merged(*scopes):
-    """Return the union of maps from a macro's name to the keys of its definitions."""
-    union = {}
-    for names in scopes:
-        for name, keys in names.items():
-            union.setdefault(name, set()).update(keys)
-    return union
-
-
-IMPORT = re.compile(r"\buse\s+(?:::\s*)?(\$?\w+)\b[^;]*;")
-CALLBACK = re.compile(r"\$\w+\s*!\s*[(\[{]")
-CALLEE = re.compile(r"(?<![\w$])(?:\$(?=crate\b))?(?P<path>(?:::\s*)?(?:\w+\s*::\s*)*)(?P<name>\w+)")
-LOCAL_TYPE = re.compile(r"\b(?:enum|struct|union|trait|type)\s+(?:r#)?(\w+)")
-USE_LEAF = re.compile(r"\b(?!(?:self|super|crate|as)\b)(\w+)\b(?!\s*::)")
-MACRO_EXPORT = re.compile(r"#\s*\[\s*macro_export\b[^\]]*\]\s*(?:#\s*(?:!\s*)?\[[^\]]*\]\s*)*macro_rules\s*!\s*\w+\s*$")
-
-
-def textual_scopes(roots, edges):
-    """Return a function of a reached file and an offset in it that gives the `macro_rules!` macros a bare name may
-    reach there, as a map from each name to the (file, offset) keys of its definitions.
-
-    Those are the macros defined earlier in the file, those in scope at every declaration or `include!` that leads
-    to the file from a crate root, and those that an earlier `include!` or `#[macro_use]` module declaration brings
-    in. A definition or declaration inside an inline module counts outside the module only when the module carries
-    `#[macro_use]` or `#![macro_use]`, and one inside a function body only in that body. A `use` item whose path
-    starts with `crate`, `self`, `super` or a module that the file declares brings in each definition of the names
-    it holds, in the module that holds the item. A `#[macro_export]` macro is visible at the top of a crate root.
-    """
-    children, inherited, active, definitions, exported, root_scope, known = {}, {}, set(), {}, {}, {}, {}
-    for target, routes in edges.items():
-        for declarer, declaration in routes:
-            children.setdefault(declarer, []).append((declaration, target))
-    for file in set(roots) | edges.keys():
-        try:
-            parsed = parse_rust(file)
-        except ValueError:
-            continue
-        mask = parsed.source.without_comments_or_strings
-        for start, _, name in macro_definitions(parsed):
-            definitions.setdefault(name, set()).add((file, start))
-            if MACRO_EXPORT.search(mask, max(0, start - 300), start):
-                root_scope.setdefault(name, set()).add((file, start))
-
-    def escapes(parsed, module):
-        return macro_use(outer_attributes(parsed.source, module.start, module.keyword)) or macro_use(inner_attributes(parsed.source, module.body + 1))
-
-    def within(parsed, position, offset, *, leaving=True):
-        return all(module.start <= offset < module.end or leaving and escapes(parsed, module) for module in parsed.modules if module.start <= position < module.end) and all(
-            function.body <= offset < function.end for function in parsed.functions if function.body <= position < function.end)
-
-    def loads_macros(parsed, declaration, child):
-        if parsed.source.without_comments_or_strings.startswith("include", declaration.keyword) or macro_use(outer_attributes(parsed.source, declaration.start, declaration.keyword)):
-            return True
-        try:
-            return macro_use(inner_attributes(parse_rust(child).source, 0))
-        except ValueError:
-            return False
-
-    def facts(file):
-        if file not in known:
-            parsed = parse_rust(file)
-            mask = parsed.source.without_comments_or_strings
-            modules = {"crate", "$crate", "self", "super"} | {item.name.rsplit("::", 1)[-1].removeprefix("r#") for item in parsed.declarations + parsed.modules}
-            imports = [(use.start(), words) for use in IMPORT.finditer(mask) if use[1] in modules and (words := [word for word in re.findall(r"\w+", use[0]) if word in definitions])]
-            known[file] = parsed, [(start, name) for start, _, name in macro_definitions(parsed)], imports
-        return known[file]
-
-    def local(file, offset, seen):
-        try:
-            parsed, defined, imports = facts(file)
-        except ValueError:
-            return {}
-        names = merged(*({name: {(file, start)}} for start, name in defined if start < offset and within(parsed, start, offset)))
-        names = merged(names, *({word: definitions[word]} for start, words in imports if within(parsed, start, offset, leaving=False) for word in words))
-        if file in roots and not any(module.start <= offset < module.end for module in parsed.modules):
-            names = merged(names, root_scope)
-        for declaration, child in children.get(file, ()):
-            if child not in seen and declaration.start < offset and within(parsed, declaration.start, offset) and loads_macros(parsed, declaration, child):
-                if child not in exported:
-                    exported[child] = local(child, float("inf"), seen | {child})
-                names = merged(names, exported[child])
-        return names
-
-    def scope(file, offset):
-        if file not in inherited:
-            if file in active:
-                return local(file, offset, {file})
-            active.add(file)
-            routes = [scope(declarer, declaration.start) for declarer, declaration in edges.get(file, ())] if file not in roots else []
-            common = set.intersection(*(set(names) for names in routes)) if routes else set()
-            inherited[file] = {name: set().union(*(names[name] for names in routes)) for name in common}
-            active.discard(file)
-        return merged(inherited[file], local(file, offset, {file}))
-
-    return scope
-
-
-def top_level(tokens):
-    """Return the tokens inside a macro invocation's delimiters with each group and attribute in them blanked."""
-    blanked, i = list(tokens), 0
-    while i < len(tokens):
-        attribute = ATTRIBUTE.match(tokens, i)
-        if attribute or tokens[i] in "([{":
-            close = after_closing(tokens, attribute.end() - 1 if attribute else i)
-            low, high = (i, close) if attribute else (i + 1, close - 1)
-            blanked[low:high] = " " * (high - low)
-            i = close
-        else:
-            i += 1
-    return "".join(blanked)
-
-
-def passes_name(tokens, name):
-    """Return whether the tokens inside a macro invocation's delimiters hold the identifier that the name pattern
-    matches where the macro may declare a module by it: outside attributes, the bodies of the functions they hold,
-    paths, field accesses and the `mod name;` and `mod name {` items that the record reads in macro bodies."""
-    skipped = [(function.body, function.end) for function in rust_functions(tokens)[0]]
-    skipped += [(attribute.start(), after_closing(tokens, attribute.end() - 1)) for attribute in ATTRIBUTE.finditer(tokens)]
-    for use in re.finditer(name, tokens):
-        before, after = tokens[:use.start()].rstrip(), tokens[use.end():].lstrip()
-        if not (any(start <= use.start() < end for start, end in skipped) or before.endswith(("::", ".")) or after.startswith("::")
-                or re.search(r"\bmod$", before) and after.startswith((";", "{"))):
-            return True
-    return False
-
-
-def attribute_parts(arguments):
-    """Return the comma-separated parts inside the delimiters of an attribute's arguments."""
-    parts, depth, start = [], 0, 1
-    for i, char in enumerate(arguments[:-1]):
-        depth += (char in "([{") - (char in ")]}")
-        if char == "," and depth == 1:
-            parts.append(arguments[start:i])
-            start = i + 1
-    return parts + [arguments[start:-1]]
-
-
-def attribute_name(content):
-    """Return the path segments, without `r#`, and the arguments of the attribute with the masked contents, or
-    None."""
-    if not (head := ATTRIBUTE_PATH.match(content)):
-        return None
-    return [segment.removeprefix("r#") for segment in re.sub(r"\s+", "", head[1]).removeprefix("::").split("::")], content[head.end():].strip()
-
-
-def derives(content):
-    """Return whether the masked contents of an attribute are a `derive` or `derive_const`, or a `cfg_attr` that
-    applies one."""
-    if not (named := attribute_name(content)):
-        return False
-    segments, arguments = named
-    return segments in (["derive"], ["derive_const"]) or segments == ["cfg_attr"] and any(derives(part) for part in attribute_parts(arguments)[1:])
-
-
-def derived(mask, run):
-    """Return whether one of a run of attributes, each (start, start of contents, end), is a derive."""
-    return any(derives(mask[opened:close - 1]) for _, opened, close in run)
-
-
-def macro_arguments(content, helpers):
-    """Return the arguments of each attribute macro that the masked contents of an attribute apply, through a
-    `cfg_attr` too: one that is neither built in, a tool's nor one of the macros that only rewrite the item they
-    apply to. With helpers, for an item that a derive applies to, an attribute by a bare name is a derive's helper
-    attribute."""
-    if not (named := attribute_name(content)):
-        return []
-    segments, arguments = named
-    if segments == ["cfg_attr"]:
-        return [found for part in attribute_parts(arguments)[1:] for found in macro_arguments(part, helpers)]
-    if segments[0] in INERT_TOOLS or "::".join(segments) in ITEM_REWRITERS or len(segments) == 1 and (
-            helpers or segments[0] in BUILTIN_ATTRIBUTES or segments[0].startswith("rustc_")):
-        return []
-    return [arguments[1:] if arguments.startswith("=") else arguments[1:-1]]
-
-
-def item_attributes(mask, start, end):
-    """Yield the start, the start of the contents and the end of each attribute in mask[start:end] on an item, with
-    its run of adjacent attributes: a run that starts the tokens or follows a `;`, a `{` or a `}`."""
-    runs = []
-    for attribute in ATTRIBUTE.finditer(mask, start, end):
-        found = attribute.start(), attribute.end(), after_closing(mask, attribute.end() - 1)
-        if runs and not mask[runs[-1][-1][2]:found[0]].strip():
-            runs[-1].append(found)
-        else:
-            runs.append([found])
-    for run in runs:
-        before = run[0][0] - 1
-        while before >= start and (mask[before].isspace() or mask[before] == "﻿"):
-            before -= 1
-        if before < start or mask[before] in ";{}":
-            for found in run:
-                yield *found, run
-
-
-def hidden_declaration(file, parsed, path, builders, macros, scope, package):
-    """Return the offset and kind of what may load path in file where the record cannot read the cfg around it.
-
-    That is a `mod name;` inside a macro or function body, with the inline modules around it in a macro body, a
-    `path = "..."` attribute setting there that names path's file name, an `include!("...")` there of a file that
-    is path or names path's module or file name, or whose `env!("CARGO_MANIFEST_DIR")` path has no package to
-    stand for, a macro invocation outside function bodies that holds a string
-    naming path's file name, and an invocation of one of the builders macros that names path's module. So is an
-    invocation outside function bodies of a macro that is not one of the readable macros, or that a path outside the
-    crate names, when it may pass path's module on as the name of a module it declares. So is an invocation of a
-    callback macro, whose transcriber invokes `$mac!`, whose tokens name such a macro. The invocations at item
-    positions in a `macro_rules!` transcriber or a readable macro's invocation count too.
-    """
-    module = path.parent.name if path.name == "mod.rs" else path.stem
-    names = re.compile(rf"\b{re.escape(module)}\b|{re.escape(path.name)}")
-    mask, text = parsed.source.without_comments_or_strings, parsed.source.uncommented
-    literals = dict(parsed.source.literals)
-    bodies = [(function.body, function.end) for function in parsed.functions]
-
-    def loads(position, region):
-        """Return whether a `mod module;` at position, inside the macro body that starts at region or at the top of
-        the file for None, with the inline modules around it there, may load path."""
-        declaration = RustFunction(module, position, position, position, position + 1)
-        inner = []
-        if region is not None:
-            for opening in HIDDEN_MODULE.finditer(mask, region, position):
-                if position < (close := after_closing(mask, opening.end() - 1)):
-                    boundary = max([region] + [mask.rfind(c, region, opening.start()) for c in ";{}"]) + 1
-                    inner.append(RustFunction(opening[1], boundary, opening.start(), opening.end() - 1, close))
-        return any(target.is_file() and target.resolve() == path for owner in (True, False) for target, _ in module_files(file, owner, parsed, declaration, inner))
-
-    for start, end in parsed.opaque + bodies:
-        for match in HIDDEN_DECLARATION.finditer(mask, start, end):
-            if match[1] == module and loads(match.start(), start if (start, end) in parsed.opaque else None):
-                return match.start(), HIDDEN
-        for setting in HIDDEN_PATH.finditer(mask, start, end):
-            value = string_value(text[setting.end():literals.get(setting.end(), setting.end())])
-            if value is not None and Path(value).name == path.name:
-                return setting.start(), HIDDEN
-        for call in INCLUDE_CALL.finditer(mask, start, end):
-            close = after_closing(mask, call.end() - 1)
-            try:
-                included = include_path(text[call.end():close - 1], file, package)
-            except ValueError:
-                return call.start(), INCLUDED
-            if included is not None and included.is_file() and (
-                    included.resolve() == path or names.search(included.read_text(encoding="utf-8", errors="replace"))):
-                return call.start(), INCLUDED
-    starts = [begin for begin, _ in parsed.source.literals]
-    local_roots = {"crate", "self", "super", "Self"} | {item.name.rsplit("::", 1)[-1].removeprefix("r#") for item in parsed.declarations + parsed.modules} | set(LOCAL_TYPE.findall(mask))
-    imported = {leaf for use in IMPORT.finditer(mask) if use[1] not in local_roots | {"$crate"} and not any(body <= use.start() < body_end for body, body_end in bodies)
-                for leaf in USE_LEAF.findall(use[0], 3)}
-
-    def unread_callee(callee, visible):
-        """Return whether a path or a name in a callback invocation's tokens may call a macro that the record cannot
-        read: through a path outside the crate, by a name that a `use` item imports from another crate, or as a local
-        macro that the record cannot read or whose body declares `mod $<name>;`."""
-        head = re.match(r"\s*(::|\w+)", callee["path"])
-        if head and head[1] not in local_roots or not head and callee["name"] in imported:
-            return True
-        found = (macros.every if head else visible).get(callee["name"], set())
-        return bool(found) and (callee["name"] in builders or not found <= macros.readable.get(callee["name"], set()))
-
-    def calls_back(invoked, tokens, visible):
-        """Return whether an invocation of a callback names, outside the groups and attributes in its tokens, a macro
-        that the record cannot read."""
-        found = (macros.every if invoked["path"] else visible).get(invoked["name"], set())
-        return bool(found & macros.callbacks) and any(unread_callee(callee, visible) for callee in CALLEE.finditer(top_level(tokens)))
-
-    def names_file(low, high):
-        """Return whether a string literal that starts in mask[low:high] names path's file name."""
-        return any(Path(string_value(text[begin:stop]) or "").name == path.name for begin, stop in parsed.source.literals[bisect.bisect_left(starts, low):bisect.bisect_left(starts, high)])
-
-    identifier = rf"\b{re.escape(module)}\b"
-    named = rf"(?<![$@]){identifier}"
-    for start, end in parsed.opaque:
-        invoked = INVOKED.search(mask, max(0, start - 100), start)
-        if invoked and invoked["name"] in INCLUDES or not (invoked or DEFINED.search(mask, max(0, start - 100), start)):
-            continue
-        if invoked and invoked["name"] in builders and re.search(identifier, mask[start:end]):
-            return start, BUILT
-        if any(body <= start < body_end for body, body_end in bodies):
-            continue
-        if re.search(identifier, mask[start:end]) or names_file(start, end):
-            visible = scope(file, start) if invoked else macros.every
-            if invoked and (not readable(invoked, macros, visible) or calls_back(invoked, mask[start + 1:end - 1], visible)):
-                if passes_name(mask[start + 1:end - 1], identifier):
-                    return start, UNREAD
-            else:
-                regions = [(start + 1, end - 1)] if invoked else [(begin, stop) for _, begin, stop in transcribers(mask, start + 1, end - 1)]
-                for nested, tokens in (found for begin, stop in regions for found in item_invocations(mask, begin, stop, macros, visible)):
-                    if nested["name"] in builders and re.search(named, tokens) or nested["name"] not in INCLUDES and names_file(nested.end(), nested.end() + len(tokens)):
-                        return nested.start(), BUILT
-                    if nested["name"] not in INCLUDES and (not readable(nested, macros, visible) or invoked and calls_back(nested, tokens, visible)) and passes_name(tokens, named):
-                        return nested.start(), UNREAD
-        if invoked and names_file(start, end):
-            return start, BUILT
-    regions = [(SCRIPT_HEAD.match(mask).end(), len(mask), None, parsed.opaque + bodies)]
-    for start, end in parsed.opaque:
-        invoked = INVOKED.search(mask, max(0, start - 100), start)
-        if any(body <= start < body_end for body, body_end in bodies):
-            continue
-        if invoked and invoked["name"] not in INCLUDES:
-            regions.append((start + 1, end - 1, start, ()))
-        elif not invoked and DEFINED.search(mask, max(0, start - 100), start):
-            regions += [(begin, stop, start, ()) for _, begin, stop in transcribers(mask, start + 1, end - 1)]
-    for begin, end, region, excluded in regions:
-        for start, opened, close, run in item_attributes(mask, begin, end):
-            file_named = names_file(opened, close)
-            if not (file_named or re.search(named, mask[opened:close])) or any(low <= start < high for low, high in excluded):
-                continue
-            if (arguments := macro_arguments(mask[opened:close - 1], derived(mask, run))) and (
-                    file_named or any(passes_name(found, named) for found in arguments) and loads(start, region)):
-                return start, ATTRIBUTED
-    return None
 
 
 def declaration_guards(path):
@@ -1167,38 +694,19 @@ def declaration_guards(path):
     or `unguarded` for a route without any, sorted and separated by `; `.
 
     It follows each declaration from the crate roots by rustc's rules, including `#[path = "..."]` and each path
-    that a cfg_attr may set, and each `include!("...")` item. It fails for a file that no root reaches, for a module
-    declaration inside a macro or a function body of a reached file that may load path, and for a macro invocation
-    there that may build one, such as an invocation of a macro from another crate that names path's module.
+    that a cfg_attr may set, and each `include!("...")` item outside function bodies. It does not expand macros, so
+    a declaration that a macro holds or builds is not a route it reads; `compiled_problems` checks those against the
+    harnesses that Kani compiles. It fails for a file that no route it reads reaches, and names each reached file,
+    declaration and `include!` that it could not read.
     """
     if (crates := crate_roots(path)) is None:
         return "", {""}
     roots, named = crates
-    edges, broken, packages = module_tree(roots)
+    edges, broken = module_tree(roots)
     if path in roots and path not in edges:
         return "", {""}
-    module = path.parent.name if path.name == "mod.rs" else path.stem
-    for message, text in broken:
-        if text is None or re.search(rf"\b{re.escape(module)}\b|{re.escape(path.name)}", text):
-            raise ValueError(message)
-    parsed_files = []
-    for file in sorted(set(roots) | edges.keys()):
-        try:
-            parsed_files.append((file, parse_rust(file)))
-        except ValueError:
-            continue
-    builders = set().union(*(module_builders(parsed) for _, parsed in parsed_files))
-    scope = textual_scopes(roots, edges)
-    macros = readable_macros(parsed_files, builders)
-    for file, parsed in parsed_files:
-        if hidden := hidden_declaration(file, parsed, path, builders, macros, scope, packages.get(file)):
-            offset, kind = hidden
-            line = parsed.source.without_comments_or_strings.count("\n", 0, offset) + 1
-            remedies = {UNREAD: "if the macro declares no module, keep the module's name out of the invocation or rename the module", ATTRIBUTED: "if the attribute declares no module, keep the module's name out of its arguments or rename the module"}
-            remedy = remedies.get(kind, "declare the module outside macros and function bodies")
-            raise ValueError(f"{file}:{line}: {kind} {path}, and the record cannot read the cfg around it; {remedy}")
     if path not in edges:
-        unread = "".join(f"; {message}" for message, _ in broken)
+        unread = "".join(f"; {message}" for message in broken)
         raise ValueError(f"{path}: no module declaration that the record can read leads to this file from a crate root; declare it with `mod <name>;` or `#[path = \"...\"]` outside macros and function bodies, in a file that a crate root reaches{unread}")
 
     def routes(file, visiting):

@@ -465,7 +465,7 @@ test("a cfg on the out-of-line mod declarations that lead to a recorded Kani har
   const broken = crate({ "lib.rs": "mod proofs;\nfn open() {\n", "proofs.rs": harness });
   const failed = baseline(broken, "record", join(broken, "record.json"), join(broken, "proofs.rs"));
   assert.equal(failed.status, 1);
-  assert.match(failed.stdout, new RegExp(`^FAIL baseline: ${join(broken, "lib.rs")}: unbalanced \\{`));
+  assert.match(failed.stdout, new RegExp(`^FAIL baseline: ${join(broken, "proofs.rs")}: no module declaration that the record can read leads to this file from a crate root; .*; ${join(broken, "lib.rs")}: unbalanced \\{`));
 });
 
 test("a cfg after an attribute that holds fn or mod is read up to the item's own keyword", () => {
@@ -531,23 +531,17 @@ test("a cfg on a #[path] declaration or in another crate root that leads to a Ka
   assert.equal(guards({ "Cargo.toml": "[workspace]\nmembers = []\n", "crates/foo/lib.rs": "#[cfg(w)] mod proofs;\n", "crates/foo/proofs.rs": harness }, "crates/foo/proofs.rs"), "cfg(w)");
   assert.equal(guards({ ...cargo, "src/main.rs": `#[cfg(z)] #[path = "lib.rs"] mod lib;\nfn main() { let path = "lib.rs"; }\n`, "src/lib.rs": harness }, "src/lib.rs"), "routes(lib.rs: unguarded; main.rs: cfg(z))");
   assert.equal(guards({ ...cargo, "src/main.rs": `fn main() { let path = "lib.rs"; }\n`, "src/lib.rs": harness }, "src/lib.rs"), "");
-  assert.equal(guards({ "lib.rs": "mod a;\ncfg_if::cfg_if! { if #[cfg(unix)] { mod sys; } }\n", "sys.rs": "", "a.rs": "#[cfg(s)] mod sys;\n", "a/sys.rs": harness }, "a/sys.rs"), "cfg(s)");
   assert.equal(guards({ "lib.rs": "#[cfg(m)] mod r#match;\n", "match/mod.rs": harness }, "match/mod.rs"), "cfg(m)");
   assert.equal(guards({ "lib.rs": 'mod proofs;\n#[path = "sys\\\\win.rs"] mod sys;\n', "proofs.rs": harness }, "proofs.rs"), "");
 
-  const hidden = recorded({ "lib.rs": "cfg_if::cfg_if! {\n    if #[cfg(kani)] {\n        mod proofs;\n    }\n}\n", "proofs.rs": harness }, "proofs.rs");
-  assert.equal(hidden.result.status, 1);
-  assert.match(hidden.result.stdout, new RegExp(`^FAIL baseline: ${join(hidden.dir, "lib.rs")}:3: a module declaration inside a macro or function body may load ${join(hidden.dir, "proofs.rs")}`));
   const wrapped = recorded({ "lib.rs": "mod proofs;\n", "proofs.rs": harness }, "proofs.rs");
   writeFileSync(join(wrapped.dir, "lib.rs"), "cfg_if::cfg_if! { if #[cfg(feature = \"slow\")] { mod proofs; } }\n");
   const failed = baseline(wrapped.dir, "compare", wrapped.record);
   assert.equal(failed.status, 1);
   assert.equal(lines(failed)[0], `CHANGED ${join(wrapped.dir, "proofs.rs")}`);
-  assert.match(lines(failed)[1], /^ {2}FAIL .*lib\.rs:1: a module declaration inside a macro/);
+  assert.match(lines(failed)[1], /^ {2}FAIL .*proofs\.rs: no module declaration that the record can read leads to this file/);
   const pathed = recorded({ "lib.rs": 'fn f() {\n    #[path = "checks.rs"] mod proofs;\n}\n', "checks.rs": harness }, "checks.rs");
-  assert.match(pathed.result.stdout, /lib\.rs:2: a module declaration inside a macro or function body/);
-  const quiet = recorded({ "lib.rs": 'mod a;\n#[path = "a/proofs.rs"] mod p2;\n', "a.rs": "cfg_if::cfg_if! { if #[cfg(x)] { mod proofs; } }\n", "a/proofs.rs": harness }, "a/proofs.rs");
-  assert.match(quiet.result.stdout, /a\.rs:1: a module declaration inside a macro or function body/);
+  assert.match(pathed.result.stdout, /checks\.rs: no module declaration that the record can read leads to this file/);
   const stray = recorded({ "lib.rs": "", "stray.rs": harness }, "stray.rs");
   assert.equal(stray.result.status, 1);
   assert.match(stray.result.stdout, new RegExp(`^FAIL baseline: ${join(stray.dir, "stray.rs")}: no module declaration that the record can read leads to this file from a crate root`));
@@ -669,7 +663,30 @@ test("each harness that Kani compiles from a recorded file must be on a route th
   assert.deepEqual(lines(baseline(moved.dir, "compare", moved.record)), [`CHANGED ${checks}`, "  not compiled harness inner::a", "SUMMARY 0 unchanged, 1 changed"]);
 });
 
-test("a route to a Kani harness file through include! is followed, and one that a macro may build fails the record", () => {
+test("a mod declaration inside cfg_if! is not a route the record reads, so Kani's list decides", () => {
+  const cfgIf = "cfg_if::cfg_if! {\n    if #[cfg(kani)] {\n        mod proofs;\n    }\n}\n";
+  const recorded = (lib, compiled) => {
+    const dir = realpathSync(fixture());
+    const files = { "Cargo.toml": '[package]\nname = "p"\nversion = "0.1.0"\n', "src/lib.rs": lib, "src/proofs.rs": "#[kani::proof]\nfn a() {}\n" };
+    for (const [name, text] of Object.entries(files)) {
+      mkdirSync(join(dir, name, ".."), { recursive: true });
+      writeFileSync(join(dir, name), text);
+    }
+    compiles(dir, "src/proofs.rs", compiled);
+    const proofs = join(dir, "src/proofs.rs");
+    return { proofs, result: baseline(dir, "record", join(dir, "record.json"), proofs) };
+  };
+
+  const alone = recorded(cfgIf, ["proofs::a"]);
+  assert.equal(alone.result.status, 1);
+  assert.equal(alone.result.stdout, `FAIL baseline: ${alone.proofs}: no module declaration that the record can read leads to this file from a crate root; declare it with \`mod <name>;\` or \`#[path = "..."]\` outside macros and function bodies, in a file that a crate root reaches\n`);
+
+  const beside = recorded(`#[path = "proofs.rs"] mod readable;\n${cfgIf}`, ["readable::a", "proofs::a"]);
+  assert.equal(beside.result.status, 1);
+  assert.equal(beside.result.stdout, `FAIL baseline: ${beside.proofs}: Kani compiles proofs::a from this file, but no route that the record reads gives that name; declare the module with \`mod <name>;\` or \`#[path = "..."]\` outside macros and function bodies\n`);
+});
+
+test("a route to a Kani harness file through include! is followed, and an include! inside a macro or function body is not", () => {
   const harness = "#[kani::proof]\nfn a() { kani::cover!(true); }\n";
   const recorded = (files, target) => {
     const dir = realpathSync(fixture());
@@ -706,116 +723,11 @@ test("a route to a Kani harness file through include! is followed, and one that 
   assert.equal(guards({ "lib.rs": "mod a;\n", "a.rs": 'include!("sub/one.rs");\n', "sub/one.rs": 'include!("two.rs");\n', "sub/two.rs": "#[cfg(t)] mod q;\n" }, "sub/q.rs"), "cfg(t)");
   assert.equal(guards({ "lib.rs": 'mod proofs;\nconst SOURCE: &str = include_str!("proofs.rs");\nfn f() { let _ = include_bytes!("proofs.rs"); }\n' }, "proofs.rs"), "");
   assert.equal(guards({ "lib.rs": 'mod proofs;\ninclude!(concat!(env!("OUT_DIR"), "/bindings.rs"));\n' }, "proofs.rs"), "");
-  assert.match(failure({ "lib.rs": 'mod proofs;\ninclude!(concat!(env!("OUT_DIR"), "/proofs.rs"));\n' }, "proofs.rs"), /lib\.rs:2: cannot read the path in 'include!\(concat!/);
+  assert.match(failure({ "lib.rs": 'include!(concat!(env!("OUT_DIR"), "/proofs.rs"));\n' }, "proofs.rs"), /no module declaration that the record can read leads to this file .*lib\.rs:1: cannot read the path in 'include!\(concat!\(env!\("OUT_DIR"\), "\/proofs\.rs"\)\)'; write it as a string without escapes/);
 
-  const macro = 'mod proofs;\nmacro_rules! load { ($m:ident, $p:literal) => { #[path = $p] mod $m; } }\nload!(again, "proofs.rs");\n';
-  assert.match(failure({ "lib.rs": macro }, "proofs.rs"), /^FAIL baseline: .*lib\.rs:3: a macro invocation may build a module declaration that loads .*proofs\.rs/);
-  const named = '#[path = "proofs.rs"] mod readable;\nmacro_rules! declare {\n    ($m:ident) => { mod $m; };\n}\ndeclare!(proofs);\n';
-  assert.match(failure({ "lib.rs": named }, "proofs.rs"), /lib\.rs:5: a macro invocation may build a module declaration that loads/);
-  assert.equal(guards({ "lib.rs": "mod proofs;\nmacro_rules! declare {\n    ($m:ident) => { mod $m; };\n}\ndeclare!(other);\n", "other.rs": "" }, "proofs.rs"), "");
-  const unread = /lib\.rs:2: an invocation of a macro that the record cannot read may build a module declaration that loads .*proofs\.rs/;
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nbuilders::declare!(proofs);\n' }, "proofs.rs"), unread);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nuse builders::declare; declare! { proofs }\n' }, "proofs.rs"), unread);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nbuilders::declare!(proofs);\nmacro_rules! declare { ($m:ident) => { struct $m; } }\n' }, "proofs.rs"), unread);
-  assert.equal(guards({ "lib.rs": "mod proofs;\nbuilders::declare!(other);\nfn f() { builders::declare!(proofs); }\n" }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": "mod proofs;\nmacro_rules! mark { ($m:ident) => { const _: () = (); } }\nmark!(proofs);\ncrate::mark!(proofs);\n" }, "proofs.rs"), "");
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nbuilders::declare!(mod proofs);\n' }, "proofs.rs"), unread);
-  assert.match(failure({ "lib.rs": "mod proofs;\nbuilders::declare!(proofs);\n" }, "proofs.rs"), /if the macro declares no module, keep the module's name out of the invocation or rename the module/);
-  const forwarded = /lib\.rs:3: an invocation of a macro that the record cannot read may build a module declaration that loads .*proofs\.rs/;
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! wrap { ($m:ident) => { builders::declare!($m); } }\nwrap!(proofs);\n' }, "proofs.rs"), forwarded);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! inner { ($m:ident) => { builders::declare!($m); } }\nmacro_rules! outer { ($m:ident) => { inner!($m); } }\nouter!(proofs);\n' }, "proofs.rs"), /lib\.rs:4: an invocation of a macro that the record cannot read/);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! wrap { () => { builders::declare!(proofs); }; }\nwrap!();\n' }, "proofs.rs"), unread);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! wrap { ($($t:tt)*) => { $($t)* } }\nwrap! { builders::declare!(proofs); }\n' }, "proofs.rs"), forwarded);
-  assert.equal(guards({ "lib.rs": "mod proofs;\nmacro_rules! mark { ($m:ident) => { thread_local!(static X: u8 = 0); struct $m; } }\nmark!(proofs);\n" }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": 'mod proofs;\nmacro_rules! named { ($m:ident) => { fn $m() { println!("{}", stringify!($m)); } } }\nnamed!(proofs);\n' }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": 'mod proofs;\nstruct S;\nimpl S { fn f() { let proofs = 0; println!("{}", proofs); } }\n' }, "proofs.rs"), "");
-  const chained = '#[path = "proofs.rs"] mod readable;\nmacro_rules! declare { ($m:ident) => { mod $m; } }\nmacro_rules! outer { ($m:ident) => { declare!($m); } }\nouter!(proofs);\n';
-  assert.match(failure({ "lib.rs": chained }, "proofs.rs"), /lib\.rs:4: an invocation of a macro that the record cannot read/);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! declare { ($m:ident) => { mod $m; } }\nmacro_rules! wrap { ($($t:tt)*) => { $($t)* } }\nwrap! { declare!(proofs); }\n' }, "proofs.rs"), /lib\.rs:4: a macro invocation may build a module declaration that loads/);
-  const checked = { "Cargo.toml": '[package]\nname = "p"\nversion = "0.1.0"\n', "src/lib.rs": "mod queue;\n", "tests/suite.rs": "macro_rules! suite {\n    ($m:ident) => { mod $m { #[test] fn works() { assert!($m::CAP > 0); } } };\n}\nsuite!(queue);\n" };
-  assert.equal(guards(checked, "src/queue.rs"), "");
-  const helpers = "macro_rules! len { ($proofs:expr, $n:expr) => { assert_eq!($proofs.len(), $n) }; }\nmacro_rules! empty { ($q:expr) => {{ let proofs = $q; assert!(proofs.is_empty()); }}; }\nmacro_rules! show { () => { println!(\"{}\", proofs) }; }\n";
-  assert.equal(guards({ "lib.rs": `mod proofs;\n${helpers}` }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": "mod proofs;\nmacro_rules! m { ($name:ident, $c:expr) => { const _: () = if !($c) { panic!() }; pub struct $name; }; }\nm!(proofs, true);\n" }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": "mod proofs;\nmacro_rules! check { ($name:ident, $e:expr) => { const _: () = assert!($e); pub struct $name; }; }\ncheck!(proofs, 1 > 0);\n" }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": 'mod proofs;\nmacro_rules! suite { ($name:ident) => { #[doc = concat!("Tests for ", stringify!($name))] mod $name {} }; }\nsuite!(proofs);\n' }, "proofs.rs"), "");
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! wrap { (fn $m:ident) => { builders::declare!($m); }; }\nwrap!(fn proofs);\n' }, "proofs.rs"), forwarded);
-  const callback = "mod proofs;\nmacro_rules! strip { ($mac:ident!($($t:tt)*)) => { $mac!([] $($t)*); }; }\nmacro_rules! shape {\n    ([] struct $name:ident { $($f:tt)* }) => { struct $name { $($f)* } };\n    ($($t:tt)*) => { strip!(shape!($($t)*)); };\n}\nshape! { struct S { proofs: u8 } }\n";
-  assert.equal(guards({ "lib.rs": callback }, "proofs.rs"), "");
-  const caller = /lib\.rs:3: an invocation of a macro that the record cannot read may build a module declaration that loads .*proofs\.rs/;
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! call { ($mac:path, $m:ident) => { $mac!($m); }; }\ncall!(builders::declare, proofs);\n' }, "proofs.rs"), caller);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! call { ($mac:ident, $m:ident) => { $mac!($m); }; }\ncall!(declare, proofs);\nuse builders::declare;\n' }, "proofs.rs"), caller);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! call { ($mac:path, $m:ident) => { $mac!($m); }; }\ncall!(::builders::declare, proofs);\n' }, "proofs.rs"), caller);
-  for (const callee of ["macro_rules! wrap { ($m:ident) => { builders::declare!($m); }; }\n", "macro_rules! wrap { ($m:ident) => { mod $m; }; }\n"]) {
-    assert.match(failure({ "lib.rs": `#[path = "proofs.rs"] mod readable;\nmacro_rules! call { ($mac:ident, $m:ident) => { $mac!($m); }; }\n${callee}call!(wrap, proofs);\n` }, "proofs.rs"), /lib\.rs:4: an invocation of a macro that the record cannot read/);
-  }
-  const shared = "mod proofs;\nmacro_rules! shared_api { ($mac:ident) => { $mac! { struct Program { proofs: u8 } } }; }\nmacro_rules! encode { ($($t:tt)*) => { $($t)* } }\nshared_api!(encode);\n#[macro_export]\nmacro_rules! constant { ($m:ident) => { const $m: u8 = 0; } }\nmacro_rules! call { ($mac:path, $m:ident) => { $mac!($m); }; }\ncall!(crate::constant, proofs);\n";
-  assert.equal(guards({ "lib.rs": shared }, "proofs.rs"), "");
-  const apply = "mod proofs;\nmacro_rules! apply { ($mac:ident { $($t:tt)* }) => { $mac! { $($t)* } }; }\nmacro_rules! encode { ($($t:tt)*) => { $($t)* } }\n";
-  for (const tokens of ["struct S { proofs: std::vec::Vec<u8> }", "const proofs: u32 = u32::MAX;", "#[derive(serde::Serialize)] struct S { proofs: u8 }", "struct S { proofs: u8 } impl S { fn f(&self) -> usize { core::mem::size_of::<Self>() } }"]) {
-    assert.equal(guards({ "lib.rs": `${apply}apply!(encode { ${tokens} });\n` }, "proofs.rs"), "", tokens);
-  }
-  assert.equal(guards({ "lib.rs": `${apply}use std::io::{self, Read};\nfn unrelated() { use std::fmt::Write; }\napply!(encode { struct S { proofs: u8 } trait Write {} impl S { fn f(&self) {} } });\n` }, "proofs.rs"), "");
-  const local = "macro_rules! declare { ($m:ident) => { struct $m; } }\n";
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmod other;\nuse builders::declare;\ndeclare!(proofs);\n', "other.rs": local }, "proofs.rs"), /lib\.rs:4: an invocation of a macro that the record cannot read/);
-  assert.match(failure({ "lib.rs": `#[path = "proofs.rs"] mod readable;\nmod m { ${local}}\nuse builders::declare;\ndeclare!(proofs);\n` }, "proofs.rs"), /lib\.rs:5: an invocation of a macro that the record cannot read/);
-  assert.match(failure({ "lib.rs": `#[path = "proofs.rs"] mod readable;\nuse builders::declare;\nmod a;\n${local}`, "a.rs": "declare!(proofs);\n" }, "proofs.rs"), /a\.rs:1: an invocation of a macro that the record cannot read/);
-  assert.equal(guards({ "lib.rs": "mod proofs;\n#[macro_use]\nmod other;\ndeclare!(proofs);\n", "other.rs": local }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": `mod proofs;\n#[macro_use] mod m { ${local}}\ndeclare!(proofs);\n` }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": `mod proofs;\n${local}mod a;\n`, "a.rs": "mod b;\n", "a/b.rs": "declare!(proofs);\n" }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": 'mod proofs;\ninclude!("defs.rs");\ndeclare!(proofs);\n', "defs.rs": local }, "proofs.rs"), "");
-  const exported = "#[macro_export]\nmacro_rules! declare { ($m:ident) => { struct $m; } }\n";
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmod a;\n#[macro_export]\nmacro_rules! declare { ($m:ident) => { builders::declare!($m); } }\ncrate::declare!(proofs);\n', "a.rs": local }, "proofs.rs"), /lib\.rs:5: an invocation of a macro that the record cannot read/);
-  const callsite = { "lib.rs": '#[path = "a/proofs.rs"] mod readable;\nmacro_rules! inner { ($m:ident) => { struct $m; } }\nmacro_rules! wrap { ($m:ident) => { inner!($m); } }\nmod a;\n', "a.rs": "macro_rules! inner { ($m:ident) => { builders::declare!($m); } }\nwrap!(proofs);\n" };
-  assert.match(failure(callsite, "a/proofs.rs"), /a\.rs:2: an invocation of a macro that the record cannot read/);
-  assert.equal(guards({ "lib.rs": "macro_rules! wrap { ($m:ident) => { inner!($m); } }\nmod a;\n", "a.rs": `mod proofs;\nmacro_rules! inner { ($m:ident) => { struct $m; } }\nwrap!(proofs);\n` }, "a/proofs.rs"), "");
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmod defs;\nmod x { use crate::declare; }\nmod y { use builders::declare; declare!(proofs); }\n', "defs.rs": exported }, "proofs.rs"), /lib\.rs:4: an invocation of a macro that the record cannot read/);
-  assert.equal(guards({ "lib.rs": "mod proofs;\nmod defs;\ndeclare!(proofs);\n", "defs.rs": `#![macro_use]\n${local}` }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": "mod proofs;\nmod defs;\ndeclare!(proofs);\n", "defs.rs": exported }, "proofs.rs"), "");
-  const attributed = /lib\.rs:2: an attribute macro that the record cannot read may build a module declaration that loads .*proofs\.rs/;
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\n#[builders::declare(proofs)]\nstruct S;\n' }, "proofs.rs"), attributed);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\n#[declare(proofs)]\nstruct S;\nuse builders::declare;\n' }, "proofs.rs"), attributed);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\n#[cfg_attr(feature = "x", builders::declare(proofs))]\nstruct S;\n' }, "proofs.rs"), attributed);
-  const inline = '#[path = "m/proofs.rs"] mod readable;\nmod m {\n    #[builders::declare(proofs)]\n    struct S;\n}\n';
-  assert.match(failure({ "lib.rs": inline }, "m/proofs.rs"), /lib\.rs:3: an attribute macro that the record cannot read/);
-  assert.equal(guards({ "lib.rs": inline.replace("m/proofs.rs", "proofs.rs") }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": "mod proofs;\n", "proofs.rs": "#[kani::proof]\nfn a() { kani::cover!(true); }\n#[cfg(test)]\nmod tests {\n    #[serial_test::serial(proofs)]\n    #[test]\n    fn t() {}\n}\n" }, "proofs.rs"), "");
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\ncfg_if::cfg_if! { if #[cfg(x)] { #[builders::declare(proofs)] struct S; } }\n' }, "proofs.rs"), attributed);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! w { ($m:ident) => { #[builders::declare($m)] struct S; } }\nw!(proofs);\n' }, "proofs.rs"), /lib\.rs:3: an invocation of a macro that the record cannot read/);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\n#[builders::declare(path = "proofs.rs")]\nstruct S;\n' }, "proofs.rs"), attributed);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\n#[builders::r#declare(proofs)]\nstruct S;\n' }, "proofs.rs"), attributed);
-  assert.match(failure({ "lib.rs": '﻿#[path = "proofs.rs"] mod readable;\n#[builders::declare(proofs)]\nstruct S;\n' }, "proofs.rs"), attributed);
-  assert.equal(guards({ "lib.rs": "mod proofs;\n#[cfg_accessible(proofs)]\n#[rust_analyzer::skip(proofs)]\n#[miri::skip(proofs)]\nstruct S;\n#[derive_const(Clone)]\n#[helper(proofs)]\nstruct T;\n" }, "proofs.rs"), "");
-  assert.match(failure({ "lib.rs": "mod proofs;\n#[builders::declare(proofs)]\nstruct S;\n" }, "proofs.rs"), /if the attribute declares no module, keep the module's name out of its arguments or rename the module/);
-  const inert = 'mod proofs;\n#![allow(dead_code)]\n#[derive(Clone)]\n#[repr(C)]\npub struct Proofs;\n#[cfg_attr(test, derive(Debug))]\n#[doc = "proofs"]\n#[builders::declare(other, proofs::Item)]\nstruct T { #[serde(rename = "x")] proofs: u8 }\nimpl T { #[builders::declare(proofs)] fn f() {} }\nfn g() { #[builders::declare(proofs)] let x = 1; }\n#[kani::proof]\n#[cfg(proofs)]\nfn h() {}\n';
-  assert.equal(guards({ "lib.rs": inert }, "proofs.rs"), "");
-  const derived = 'mod proofs;\n#[derive(Clone)]\n#[helper(proofs)]\nstruct S;\n#[cfg_attr(feature = "x", derive(Bake))]\n#[cfg_attr(feature = "x", databake(path = proofs))]\nstruct T;\n#[tracing::instrument(skip(proofs))]\nfn f(proofs: u8) {}\n';
-  assert.equal(guards({ "lib.rs": derived }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": "mod proofs;\nstruct Tuple(#[builders::declare(proofs)] u8, #[into(proofs)] u16);\n" }, "proofs.rs"), "");
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\n#[derive(Clone)]\n#[builders::declare(proofs)]\nstruct S;\n' }, "proofs.rs"), /lib\.rs:3: an attribute macro that the record cannot read/);
-  assert.match(failure({ "lib.rs": '#[path = "proofs.rs"] mod readable;\nmacro_rules! wrap { () => { builders::declare_at!(x, "proofs.rs"); }; }\nwrap!();\n' }, "proofs.rs"), /lib\.rs:2: a macro invocation may build a module declaration that loads .*proofs\.rs/);
-  assert.equal(guards({ "lib.rs": 'mod proofs;\nmacro_rules! wrap { () => { builders::declare_at!(x, "other.rs"); const NAME: &str = "proofs.rs"; }; }\nwrap!();\n' }, "proofs.rs"), "");
-  const recursive = "mod proofs;\nmod t {\n    macro_rules! make { ($m:ident) => { struct $m; }; ($m:ident, $n:ident) => { make!($m); make!($n); }; }\n    make!(proofs, other);\n}\n";
-  assert.equal(guards({ "lib.rs": recursive }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": `mod proofs;\nmod a;\n${local}declare!(proofs);\n`, "a.rs": "macro_rules! declare { ($m:ident) => { builders::declare!($m); } }\n" }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": "mod proofs;\n#[macro_use] mod defs;\nmod a;\n", "defs.rs": "#[macro_export]\nmacro_rules! declare { ($m:ident) => { struct $m; } }\n", "a.rs": "use crate::declare;\ndeclare!(proofs);\n" }, "proofs.rs"), "");
-  assert.equal(guards({ "lib.rs": "mod proofs;\nmod defs;\nmod a;\n", "defs.rs": "#[macro_export]\nmacro_rules! declare { ($m:ident) => { struct $m; } }\n", "a.rs": "use crate::declare;\ndeclare!(proofs);\n" }, "proofs.rs"), "");
-  const pointer = '#[path = "outer/proofs.rs"] mod readable;\nmacro_rules! wrap { ($m:ident) => { pub struct S { pub f: fn() } pub mod outer { builders::declare!($m); } }; }\nwrap!(proofs);\n';
-  assert.match(failure({ "lib.rs": pointer }, "outer/proofs.rs"), /lib\.rs:3: an invocation of a macro that the record cannot read/);
-  const uses = "mod queue;\nconst _: () = assert!(queue::CAP > 0);\ncfg_if::cfg_if! { if #[cfg(feature = \"std\")] { pub use queue::Queue; } }\n";
-  assert.equal(guards({ "lib.rs": uses + "proptest::proptest! { #[test] fn push(x in 0u8..4) { let queue = x; let _ = self.queue; } }\n" }, "queue.rs"), "");
-  assert.equal(guards({ "lib.rs": '#[cfg(kani)] mod kani;\ncfg_if::cfg_if! { if #[cfg(kani)] { const K: u8 = 1; } }\n' }, "kani/mod.rs"), "");
-  const nested = '#[path = "m/proofs.rs"] mod readable;\ncfg_if::cfg_if! {\n    if #[cfg(x)] {\n        mod m {\n            mod proofs;\n        }\n    }\n}\n';
-  assert.match(failure({ "lib.rs": nested }, "m/proofs.rs"), /lib\.rs:5: a module declaration inside a macro or function body may load/);
-  assert.equal(guards({ "lib.rs": nested.replace("mod m {", "mod n {"), "n/proofs.rs": "" }, "m/proofs.rs"), "");
-
-  const suite = { "Cargo.toml": '[package]\nname = "p"\nversion = "0.1.0"\n', "src/lib.rs": "mod queue;\n", "tests/suite.rs": "macro_rules! suite {\n    ($m:ident) => { mod $m { #[test] fn works() {} } };\n}\nsuite!(queue);\n" };
-  assert.equal(guards(suite, "src/queue.rs"), "");
-  assert.equal(guards({ "lib.rs": 'mod proofs;\npub fn harness_path() -> String { format!("{}/proofs.rs", env!("CARGO_MANIFEST_DIR")) }\n' }, "proofs.rs"), "");
   const items = { "sub/items.rs": '#[path = "proofs.rs"] mod again;\n' };
   const wrapped = '#[path = "sub/proofs.rs"] mod proofs;\nmacro_rules! wrap { ($($t:tt)*) => { $($t)* } }\nwrap! { include!("sub/items.rs"); }\n';
-  assert.match(failure({ "lib.rs": wrapped, ...items }, "sub/proofs.rs"), /lib\.rs:3: an include! inside a macro or function body reads a file that may load/);
-  assert.equal(guards({ "lib.rs": wrapped, "sub/items.rs": "mod other;\n", "sub/other.rs": "" }, "sub/proofs.rs"), "");
+  assert.equal(guards({ "lib.rs": wrapped, ...items }, "sub/proofs.rs"), "");
   assert.equal(guards({ "lib.rs": '#[path = "sub/proofs.rs"] mod proofs;\n#[cfg(b)] include! { "sub/items.rs" }\n', ...items }, "sub/proofs.rs"), "routes(../lib.rs: unguarded; ../lib.rs: cfg(b))");
 
   const manifest = 'include!(concat!(env!("CARGO_MANIFEST_DIR"), "/sub/items.rs"));\n';
@@ -828,10 +740,8 @@ test("a route to a Kani harness file through include! is followed, and one that 
   assert.equal(guardedComputed.status, 1, guardedComputed.stdout);
   assert.deepEqual(lines(guardedComputed).slice(2, 4), ["    old: routes(../lib.rs: unguarded; ../lib.rs: unguarded)", '    new: routes(../lib.rs: unguarded; ../lib.rs: cfg(feature = "slow"))']);
   assert.equal(guards({ "lib.rs": '#[path = "sub/proofs.rs"] mod proofs;\n#[cfg(c)] include!(std::concat!("sub/", "items.rs",));\n', ...items }, "sub/proofs.rs"), "routes(../lib.rs: unguarded; ../lib.rs: cfg(c))");
-  assert.match(failure({ ...cargo, "lib.rs": `#[path = "sub/proofs.rs"] mod proofs;\nfn f() { ${manifest.trim()} }\n` }, "sub/proofs.rs"), /lib\.rs:2: an include! inside a macro or function body reads a file that may load/);
-  assert.match(failure({ ...items, "lib.rs": `#[path = "sub/proofs.rs"] mod proofs;\n${manifest}` }, "sub/proofs.rs"), /lib\.rs:2: cannot read the path in 'include!\(concat!.*\)': no Cargo\.toml above the crate root sets env!\("CARGO_MANIFEST_DIR"\)/);
-  const macroManifest = `#[path = "sub/proofs.rs"] mod proofs;\nmacro_rules! items { ($($i:item)*) => { $($i)* } }\nitems! { ${manifest.trim()} }\n`;
-  assert.match(failure({ ...items, "lib.rs": macroManifest }, "sub/proofs.rs"), /lib\.rs:3: an include! inside a macro or function body reads a file that may load/);
+  assert.equal(guards({ ...cargo, "lib.rs": `#[path = "sub/proofs.rs"] mod proofs;\nfn f() { ${manifest.trim()} }\n` }, "sub/proofs.rs"), "");
+  assert.match(failure({ ...items, "lib.rs": manifest }, "sub/proofs.rs"), /no module declaration that the record can read leads to this file .*lib\.rs:1: cannot read the path in 'include!\(concat!.*\)': no Cargo\.toml above the crate root sets env!\("CARGO_MANIFEST_DIR"\)/);
   const workspace = {
     "Cargo.toml": '[package]\nname = "p"\nversion = "0.1.0"\n\n[workspace]\nmembers = ["sub"]\n',
     "sub/Cargo.toml": '[package]\nname = "q"\nversion = "0.1.0"\n',
