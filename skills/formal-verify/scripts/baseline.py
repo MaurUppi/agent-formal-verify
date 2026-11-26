@@ -537,15 +537,10 @@ class RustFile(NamedTuple):
     includes: list
 
 
-PARSED = {}
-
-
 def parse_rust(path):
-    if path not in PARSED:
-        source = rust_masks(path.read_text(encoding="utf-8"))
-        _, modules, _, declarations, includes = rust_functions(source.without_comments_or_strings)
-        PARSED[path] = RustFile(source, modules, declarations, includes)
-    return PARSED[path]
+    source = rust_masks(path.read_text(encoding="utf-8"))
+    _, modules, _, declarations, includes = rust_functions(source.without_comments_or_strings)
+    return RustFile(source, modules, declarations, includes)
 
 
 def enclosing_modules(parsed, item):
@@ -631,115 +626,139 @@ def include_path(argument, file, package):
     return file.parent / "".join(pieces)
 
 
-TREES = {}
+class Route(NamedTuple):
+    """A route to a Kani harness file: its crate root, the guards on its steps, outermost first, and the module path
+    that it gives the file's items, "" at a crate root."""
+    root: Path
+    guards: str
+    module: str
 
 
-def module_tree(roots):
-    """Return the module declarations that lead to each file the crate roots reach, as {file: {(declarer,
-    declaration)}}, and the message for each reached file or declaration that could not be read.
+class RouteReader:
+    """Read the routes that lead to Kani harness files from their crate roots.
 
-    An `include!("...")` item outside function bodies leads to the file it names, relative to the including file,
-    which declares modules as a file that owns its directory does, whatever inline modules hold the include.
+    It parses each file and walks each crate's module tree once, so make one per run: it does not see a file that
+    changes after it has read it.
     """
-    if roots not in TREES:
-        edges, broken, seen = {}, [], set()
-        work = [(root, True, next((folder for folder in root.parents if (folder / "Cargo.toml").is_file()), None)) for root in roots]
-        while work:
-            file, owner, package = work.pop()
-            if (file, owner, package) in seen:
-                continue
-            seen.add((file, owner, package))
-            try:
-                parsed = parse_rust(file)
-            except ValueError as error:
-                broken.append(f"{file}: {error}")
-                continue
-            for declaration in parsed.declarations:
-                try:
-                    targets = list(module_files(file, owner, parsed, declaration))
-                except ValueError as error:
-                    broken.append(str(error))
+
+    def __init__(self):
+        self.parsed, self.trees = {}, {}
+
+    def parse(self, path):
+        if path not in self.parsed:
+            self.parsed[path] = parse_rust(path)
+        return self.parsed[path]
+
+    def module_tree(self, roots):
+        """Return the module declarations that lead to each file the crate roots reach, as {file: {(declarer,
+        declaration)}}, and the message for each reached file or declaration that could not be read.
+
+        An `include!("...")` item outside function bodies leads to the file it names, relative to the including file,
+        which declares modules as a file that owns its directory does, whatever inline modules hold the include.
+        """
+        if roots not in self.trees:
+            edges, broken, seen = {}, [], set()
+            work = [(root, True, next((folder for folder in root.parents if (folder / "Cargo.toml").is_file()), None)) for root in roots]
+            while work:
+                file, owner, package = work.pop()
+                if (file, owner, package) in seen:
                     continue
-                for target, owns in targets:
-                    if target.is_file():
+                seen.add((file, owner, package))
+                try:
+                    parsed = self.parse(file)
+                except ValueError as error:
+                    broken.append(f"{file}: {error}")
+                    continue
+                for declaration in parsed.declarations:
+                    try:
+                        targets = list(module_files(file, owner, parsed, declaration))
+                    except ValueError as error:
+                        broken.append(str(error))
+                        continue
+                    for target, owns in targets:
+                        if target.is_file():
+                            target = target.resolve()
+                            edges.setdefault(target, set()).add((file, declaration))
+                            work.append((target, owns, package))
+                for include in parsed.includes:
+                    invocation = rust_masks(parsed.source.uncommented[include.keyword:include.end])
+                    line = parsed.source.without_comments_or_strings.count("\n", 0, include.keyword) + 1
+                    shown = collapse(invocation.uncommented, invocation.literals)
+                    try:
+                        target = include_path(invocation.uncommented[invocation.without_comments_or_strings.index("!") + 1:].strip()[1:-1], file, package)
+                    except ValueError as error:
+                        broken.append(f"{file}:{line}: cannot read the path in '{shown}': {error}")
+                        continue
+                    if target is None:
+                        broken.append(f"{file}:{line}: cannot read the path in '{shown}'; write it as a string without escapes, or as concat! of such strings and env!(\"CARGO_MANIFEST_DIR\")")
+                    elif target.is_file():
                         target = target.resolve()
-                        edges.setdefault(target, set()).add((file, declaration))
-                        work.append((target, owns, package))
-            for include in parsed.includes:
-                invocation = rust_masks(parsed.source.uncommented[include.keyword:include.end])
-                line = parsed.source.without_comments_or_strings.count("\n", 0, include.keyword) + 1
-                shown = collapse(invocation.uncommented, invocation.literals)
-                try:
-                    target = include_path(invocation.uncommented[invocation.without_comments_or_strings.index("!") + 1:].strip()[1:-1], file, package)
-                except ValueError as error:
-                    broken.append(f"{file}:{line}: cannot read the path in '{shown}': {error}")
+                        edges.setdefault(target, set()).add((file, include))
+                        work.append((target, True, package))
+            self.trees[roots] = edges, broken
+        return self.trees[roots]
+
+    def routes(self, path):
+        """Return the routes that lead to path from its crate roots, sorted. A crate root is one route without guards,
+        since its own crate always compiles it, unless it is a lib.rs or main.rs that Cargo does not name and another
+        file declares, which makes it a module. A file in no crate is one such route too, as Kani compiles it alone.
+
+        It follows each out-of-line `mod` declaration from the crate roots by rustc's rules, including
+        `#[path = "..."]` and each path that a cfg_attr may set, and each `include!("...")` item outside function
+        bodies. It does not expand macros, so a declaration that a macro holds or builds is not a route it reads;
+        `compiled_problems` checks those against the harnesses that Kani compiles.
+
+        Raises:
+            ValueError: No route that it reads reaches path. The message names each reached file, declaration and
+                `include!` that it could not read.
+        """
+        if (crates := crate_roots(path)) is None:
+            return [Route(path, "", "")]
+        roots, named = crates
+        edges, broken = self.module_tree(roots)
+        if path in roots and path not in edges:
+            return [Route(path, "", "")]
+        if path not in edges:
+            unread = "".join(f"; {message}" for message in broken)
+            raise ValueError(f"{path}: no module declaration that the record can read leads to this file from a crate root; declare it with `mod <name>;` or `#[path = \"...\"]` outside macros and function bodies, in a file that a crate root reaches{unread}")
+
+        def walk(file, visiting):
+            root = file in named or file in roots and all(declarer == file for declarer, _ in edges.get(file, ()))
+            found = [Route(file, "", "")] if root else []
+            for declarer, declaration in edges.get(file, ()):
+                if declarer in visiting:
                     continue
-                if target is None:
-                    broken.append(f"{file}:{line}: cannot read the path in '{shown}'; write it as a string without escapes, or as concat! of such strings and env!(\"CARGO_MANIFEST_DIR\")")
-                elif target.is_file():
-                    target = target.resolve()
-                    edges.setdefault(target, set()).add((file, include))
-                    work.append((target, True, package))
-        TREES[roots] = edges, broken
-    return TREES[roots]
+                parsed = self.parse(declarer)
+                enclosing = enclosing_modules(parsed, declaration)
+                items = [(0, 0, -1)] + [(module.start, module.keyword, module.body) for module in enclosing] + [(declaration.start, declaration.keyword, declaration.body)]
+                guards = cfg_guards(parsed.source, items)
+                # An included file's items sit in the modules around the include!; a declared file's in its module.
+                local = (enclosing[-1].name if enclosing else "") if declaration in parsed.includes else declaration.name
+                found += [Route(route.root, " ".join(filter(None, (route.guards, guards))), "::".join(filter(None, (route.module, local))))
+                          for route in walk(declarer, visiting | {declarer})]
+            return found
+
+        return sorted(walk(path, {path}))
 
 
-def declaration_guards(path):
-    """Return the guards on the out-of-line `mod` declarations that lead to path from its crate roots, outermost
-    first, and the module path that each route gives path's items, with "" for a crate root. A crate root is one
-    route without guards, since its own crate always compiles it, unless it is a lib.rs or main.rs that Cargo does
-    not name and another file declares, which makes it a module. For more than one route, the guards are
-    `routes(...)` with each route as its crate root's path relative to path's directory, a colon and its guards,
-    or `unguarded` for a route without any, sorted and separated by `; `.
-
-    It follows each declaration from the crate roots by rustc's rules, including `#[path = "..."]` and each path
-    that a cfg_attr may set, and each `include!("...")` item outside function bodies. It does not expand macros, so
-    a declaration that a macro holds or builds is not a route it reads; `compiled_problems` checks those against the
-    harnesses that Kani compiles. It fails for a file that no route it reads reaches, and names each reached file,
-    declaration and `include!` that it could not read.
-    """
-    if (crates := crate_roots(path)) is None:
-        return "", {""}
-    roots, named = crates
-    edges, broken = module_tree(roots)
-    if path in roots and path not in edges:
-        return "", {""}
-    if path not in edges:
-        unread = "".join(f"; {message}" for message in broken)
-        raise ValueError(f"{path}: no module declaration that the record can read leads to this file from a crate root; declare it with `mod <name>;` or `#[path = \"...\"]` outside macros and function bodies, in a file that a crate root reaches{unread}")
-
-    def routes(file, visiting):
-        root = file in named or file in roots and all(declarer == file for declarer, _ in edges.get(file, ()))
-        found = [(file, "", "")] if root else []
-        for declarer, declaration in edges.get(file, ()):
-            if declarer in visiting:
-                continue
-            parsed = parse_rust(declarer)
-            enclosing = enclosing_modules(parsed, declaration)
-            items = [(0, 0, -1)] + [(module.start, module.keyword, module.body) for module in enclosing] + [(declaration.start, declaration.keyword, declaration.body)]
-            guards = cfg_guards(parsed.source, items)
-            # An included file's items sit in the modules around the include!; a declared file's in its module.
-            local = (enclosing[-1].name if enclosing else "") if declaration in parsed.includes else declaration.name
-            found += [(start, " ".join(filter(None, (route, guards))), "::".join(filter(None, (module, local))))
-                      for start, route, module in routes(declarer, visiting | {declarer})]
-        return found
-
-    traced = routes(path, {path})
-    modules = {module for _, _, module in traced}
-    found = sorted((os.path.relpath(root, path.parent), guards) for root, guards, _ in traced)
+def route_label(path, routes):
+    """Return the guards that routes give path's items, as the record holds them: one route's own guards, or for more
+    than one route `routes(...)` with each route as its crate root's path relative to path's directory, a colon and
+    its guards, or `unguarded` for a route without any, sorted and separated by `; `."""
+    found = sorted((os.path.relpath(route.root, path.parent), route.guards) for route in routes)
     if len(found) == 1:
-        return found[0][1], modules
+        return found[0][1]
     labelled = "; ".join(f"{root}: {guards or 'unguarded'}" for root, guards in found)
-    return f"routes({labelled})", modules
+    return f"routes({labelled})"
 
 
-def kani_surface(path):
+def kani_surface(path, reader):
     source = rust_masks(path.read_text(encoding="utf-8"))
     text, mask = source.uncommented, source.without_comments_or_strings
     if renaming := RENAMING_IMPORT.search(mask):
         raise ValueError(f"{path}: '{collapse(renaming[0])}' brings a Kani assumption, cover, stub or harness attribute in under another name; write each as kani::<name> so the record can read it")
     functions, modules, opaque, _, _ = rust_functions(mask)
-    declared, _ = declaration_guards(path)
+    declared = route_label(path, reader.routes(path))
 
     def owner_at(position, *, attribute=False):
         if not any(start <= position < end for start, end in opaque):
@@ -814,7 +833,7 @@ def route_owner(name, modules, owners):
     return None
 
 
-def compiled_problems(path, surface, recorded=None):
+def compiled_problems(path, surface, reader, recorded=None):
     """Return the lines on which the harnesses that Kani compiles from path disagree with surface and recorded, and
     surface's harnesses that it compiles, as `harness <owner>` items, or None for them when no Cargo package holds
     path.
@@ -829,7 +848,7 @@ def compiled_problems(path, surface, recorded=None):
     if package is None:
         return [f"  not compiled {item}" for item in recorded or ()], None
     names = {harness.name for harness in compiled_in(package) if harness.source == path}
-    _, modules = declaration_guards(path)
+    modules = {route.module for route in reader.routes(path)}
     owners = {re.sub(r"\[\d+\]$", "", KANI_KEY.fullmatch(item)[2]) for item in surface if item.startswith("harness ")}
     found = {name: route_owner(name, modules, {item_path(owner): owner for owner in owners}) for name in names}
     lines = [f"  FAIL Kani compiles {name} from this file, but no route that the record reads gives that name; declare "
@@ -872,15 +891,15 @@ def record(record_path, files):
             print(f"usage: {file} has no model surface; expected one of {', '.join(KINDS)}")
             return 2
     models = read_record(record_path) if record_path.exists() else {}
-    updates, notes = {}, {}
+    updates, notes, reader = {}, {}, RouteReader()
     for file in files:
         kind = KINDS[file.suffix]
-        surface = SURFACES[kind](file.resolve())
+        surface = kani_surface(file.resolve(), reader) if kind == "kani" else SURFACES[kind](file.resolve())
         entry = {"kind": kind, "digest": digest(surface), "surface": surface}
         if kind == "kani":
             # A harness that no longer compiles is recorded from its text alone; compare asks Kani again.
             try:
-                problems, names = compiled_problems(file.resolve(), surface)
+                problems, names = compiled_problems(file.resolve(), surface, reader)
             except ValueError as error:
                 notes[str(file.resolve())] = f"  not checked against Kani: {error}"
             else:
@@ -970,17 +989,17 @@ def compare(record_path):
         print(f"usage: record file {record_path} does not exist; run record first")
         return 2
     models = read_record(record_path)
-    changed = 0
+    changed, reader = 0, RouteReader()
     for model, entry in models.items():
         try:
             if not Path(model).is_file():
                 lines = ["  file is missing"]
             else:
-                surface = SURFACES[entry["kind"]](Path(model))
+                surface = kani_surface(Path(model), reader) if entry["kind"] == "kani" else SURFACES[entry["kind"]](Path(model))
                 lines = differences(entry["kind"], entry["surface"], surface)
                 if entry["kind"] == "kani":
                     try:
-                        problems, names = compiled_problems(Path(model), surface, entry.get("compiled"))
+                        problems, names = compiled_problems(Path(model), surface, reader, entry.get("compiled"))
                         lines += problems
                         if names is not None and "compiled" not in entry:
                             lines.append("  not checked against Kani at record, so compare cannot see a harness that "
