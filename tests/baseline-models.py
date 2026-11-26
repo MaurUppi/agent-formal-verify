@@ -209,6 +209,8 @@ HIDDEN_ROUTES = [
         "sub/items.rs": '#[path = "../proofs.rs"]\nmod again;\n'}),
     ("_::readable::check", "proofs.rs", {
         "lib.rs": '#[path = "proofs.rs"] mod readable;\nconst _: () = {\n    #[path = "proofs.rs"]\n    mod readable;\n};\n'}),
+    ("_::x::check", "proofs.rs", {
+        "lib.rs": 'include!("proofs.rs");\nconst _: () = {\n    #[path = "proofs.rs"]\n    mod x;\n};\n'}),
 ]
 # Each crate invokes a macro that rustc resolves to a local one that declares no module, through a glob import, a
 # module path, and a definition that shadows one passing the name to the builders crate. Each records.
