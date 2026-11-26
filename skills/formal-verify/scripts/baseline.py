@@ -56,8 +56,6 @@ from lean_records import read_record as read_lean_record
 from rust_source import RustSource, after_closing, rust_masks
 
 FORMAT = 2
-NARROWING = {"lean": (), "tla": (), "kani": ("assume", "stub")}
-KINDS = {".statements": "lean", ".matrix": "tla", ".rs": "kani"}
 STRING = re.compile(r'"(?:\\.|[^"\\])*"', re.DOTALL)
 
 
@@ -791,23 +789,132 @@ def compiled_problems(path, surface, reader, recorded=None):
     return lines, compiled
 
 
-SURFACES = {"lean": lean_surface, "tla": tla_surface, "kani": kani_surface}
+class LeanKind:
+    """Record, compare and move the declarations of a Lean statements file."""
+
+    name, suffix, renames = "lean", ".statements", False
+
+    def entry(self, path):
+        return model_entry(self.name, lean_surface(path)), None
+
+    def changes(self, entry, path):
+        return differences(entry["surface"], lean_surface(path), ())
+
+    def valid(self, entry):
+        return True
+
+    def moved(self, entry, module, new, existing):
+        return model_entry(self.name, joined(entry["surface"], new, existing))
+
+
+class TlaKind:
+    """Record, compare and move the checks of a TLA+ matrix and the specs it runs."""
+
+    name, suffix, renames = "tla", ".matrix", False
+
+    def entry(self, path):
+        return model_entry(self.name, tla_surface(path)), None
+
+    def changes(self, entry, path):
+        old, lines = entry["surface"], differences(entry["surface"], tla_surface(path), ())
+        notes = []
+        if not any(name.startswith("imports ") for name in old):
+            notes.append("  previous baseline did not track imported modules; review and record this matrix again")
+        if "TLA+ layout version" not in old:
+            notes.append("  previous baseline did not preserve TLA+ layout; review and record this matrix again")
+        return notes + lines
+
+    def valid(self, entry):
+        return True
+
+    def moved(self, entry, module, new, existing):
+        return model_entry(self.name, joined(entry["surface"], new, existing))
+
+
+class KaniKind:
+    """Record, compare and move the harnesses of a Kani file, checked against what Kani compiles."""
+
+    name, suffix, renames = "kani", ".rs", True
+
+    def __init__(self):
+        self.reader = RouteReader()
+
+    def entry(self, path):
+        surface = kani_surface(path, self.reader)
+        entry = model_entry(self.name, surface)
+        # A harness that no longer compiles is recorded from its text alone; compare asks Kani again.
+        try:
+            problems, names = compiled_problems(path, surface, self.reader)
+        except ValueError as error:
+            return entry, f"  not checked against Kani: {error}"
+        if problems:
+            raise ValueError(f"{path}: " + "; ".join(problem.strip().removeprefix("FAIL ") for problem in problems))
+        if names is not None:
+            entry["compiled"] = names
+        return entry, None
+
+    def changes(self, entry, path):
+        surface = kani_surface(path, self.reader)
+        lines = differences(entry["surface"], surface, ("assume", "stub"))
+        try:
+            problems, names = compiled_problems(path, surface, self.reader, entry.get("compiled"))
+            lines += problems
+            if names is not None and "compiled" not in entry:
+                lines.append("  not checked against Kani at record, so compare cannot see a harness that "
+                             "stopped compiling on a route that the record does not read")
+        except ValueError as error:
+            lines.append(f"  FAIL {error}")
+        return lines
+
+    def valid(self, entry):
+        compiled = entry.get("compiled", [])
+        return isinstance(compiled, list) and all(isinstance(name, str) for name in compiled)
+
+    def moved(self, entry, module, new, existing):
+        surface, compiled = entry["surface"], entry.get("compiled")
+        if module:
+            surface = renamed(surface, *module)
+            compiled = compiled and list(renamed(dict.fromkeys(compiled), *module))
+        surface = joined(surface, new, existing)
+        if existing is not None:
+            # The merged entry holds Kani's list only when both entries were checked against Kani at record.
+            compiled = [*existing["compiled"], *compiled] if "compiled" in existing and compiled is not None else None
+        result = model_entry(self.name, surface)
+        if compiled is not None:
+            result["compiled"] = sorted(compiled)
+        return result
+
+
+def model_kinds():
+    """Return a fresh adapter for each model kind, by the name a record entry gives as its kind."""
+    return {kind.name: kind for kind in (LeanKind(), TlaKind(), KaniKind())}
 
 
 def digest(surface):
     return hashlib.sha256(json.dumps(surface, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def read_record(path):
+def model_entry(kind, surface):
+    return {"kind": kind, "digest": digest(surface), "surface": surface}
+
+
+def joined(surface, new, existing):
+    """Add the items that the entry existing records for the file new, which must not repeat an item of surface."""
+    if existing is None:
+        return surface
+    if overlap := surface.keys() & existing["surface"].keys():
+        raise ValueError(f"{new} already records {', '.join(sorted(overlap))}")
+    return {**existing["surface"], **surface}
+
+
+def read_record(path, kinds):
     record = json.loads(path.read_text(encoding="utf-8"))
     models = record.get("models") if isinstance(record, dict) else None
     if not isinstance(models, dict) or record.get("format") != FORMAT:
         raise ValueError(f"{path}: unsupported record format; run record with a new record file")
     for model, entry in models.items():
-        if not isinstance(entry, dict) or entry.get("kind") not in SURFACES or not isinstance(entry.get("surface"), dict):
-            raise ValueError(f"{path}: malformed entry for {model}")
-        compiled = entry.get("compiled", [])
-        if not isinstance(compiled, list) or not all(isinstance(name, str) for name in compiled):
+        if (not isinstance(entry, dict) or entry.get("kind") not in kinds or not isinstance(entry.get("surface"), dict)
+                or not kinds[entry["kind"]].valid(entry)):
             raise ValueError(f"{path}: malformed entry for {model}")
     return models
 
@@ -818,28 +925,19 @@ def write_record(path, models):
 
 
 def record(record_path, files):
+    kinds = model_kinds()
+    by_suffix = {kind.suffix: kind for kind in kinds.values()}
     for file in files:
-        if file.suffix not in KINDS:
-            print(f"usage: {file} has no model surface; expected one of {', '.join(KINDS)}")
+        if file.suffix not in by_suffix:
+            print(f"usage: {file} has no model surface; expected one of {', '.join(by_suffix)}")
             return 2
-    models = read_record(record_path) if record_path.exists() else {}
-    updates, notes, reader = {}, {}, RouteReader()
+    models = read_record(record_path, kinds) if record_path.exists() else {}
+    updates, notes = {}, {}
     for file in files:
-        kind = KINDS[file.suffix]
-        surface = kani_surface(file.resolve(), reader) if kind == "kani" else SURFACES[kind](file.resolve())
-        entry = {"kind": kind, "digest": digest(surface), "surface": surface}
-        if kind == "kani":
-            # A harness that no longer compiles is recorded from its text alone; compare asks Kani again.
-            try:
-                problems, names = compiled_problems(file.resolve(), surface, reader)
-            except ValueError as error:
-                notes[str(file.resolve())] = f"  not checked against Kani: {error}"
-            else:
-                if problems:
-                    raise ValueError(f"{file.resolve()}: " + "; ".join(problem.strip().removeprefix("FAIL ") for problem in problems))
-                if names is not None:
-                    entry["compiled"] = names
-        updates[str(file.resolve())] = entry
+        model = str(file.resolve())
+        updates[model], note = by_suffix[file.suffix].entry(file.resolve())
+        if note:
+            notes[model] = note
     for model, entry in updates.items():
         print(f"RECORDED {model} {entry['digest']}")
         previous = models.get(model, {}).get("digest")
@@ -870,49 +968,34 @@ def renamed(surface, old_module, new_module):
 
 
 def move(record_path, old_file, new_file, module):
-    models = read_record(record_path) if record_path.is_file() else {}
+    kinds = model_kinds()
+    models = read_record(record_path, kinds) if record_path.is_file() else {}
     old, new = str(old_file.resolve()), str(new_file.resolve())
     if old not in models:
         print(f"usage: {old} has no record entry; record it before the move")
         return 2
-    kind = models[old]["kind"]
-    if KINDS.get(new_file.suffix) != kind:
-        print(f"usage: {new} is not a {kind} model file")
+    kind = kinds[models[old]["kind"]]
+    if new_file.suffix != kind.suffix:
+        print(f"usage: {new} is not a {kind.name} model file")
         return 2
-    if module and kind != "kani":
+    if module and not kind.renames:
         print("usage: --module applies only to a Kani harness file")
         return 2
     entry = models.pop(old)
-    surface, compiled = entry["surface"], entry.get("compiled")
-    if module:
-        surface = renamed(surface, *module)
-        compiled = compiled and list(renamed(dict.fromkeys(compiled), *module))
-    if new in models:
-        if overlap := surface.keys() & models[new]["surface"].keys():
-            raise ValueError(f"{new} already records {', '.join(sorted(overlap))}")
-        surface = {**models[new]["surface"], **surface}
-        # The merged entry holds Kani's list only when both entries were checked against Kani at record.
-        compiled = [*models[new]["compiled"], *compiled] if "compiled" in models[new] and compiled is not None else None
-    models[new] = {"kind": kind, "digest": digest(surface), "surface": surface}
-    if compiled is not None:
-        models[new]["compiled"] = sorted(compiled)
+    models[new] = kind.moved(entry, module, new, models.get(new))
     write_record(record_path, models)
     print(f"MOVED {old} -> {new}")
     return 0
 
 
-def differences(kind, old, new):
+def differences(old, new, narrowing):
     lines = []
-    if kind == "tla" and not any(name.startswith("imports ") for name in old):
-        lines.append("  previous baseline did not track imported modules; review and record this matrix again")
-    if kind == "tla" and "TLA+ layout version" not in old:
-        lines.append("  previous baseline did not preserve TLA+ layout; review and record this matrix again")
     for name in old:
         if name not in new:
             lines.append(f"  removed {name}")
         elif old[name] != new[name]:
             lines += [f"  changed {name}", f"    old: {old[name]}", f"    new: {new[name]}"]
-    lines += [f"  added {name}" for name in new if name not in old and name.split(" ", 1)[0] in NARROWING[kind]]
+    lines += [f"  added {name}" for name in new if name not in old and name.split(" ", 1)[0] in narrowing]
     return lines
 
 
@@ -920,24 +1003,15 @@ def compare(record_path):
     if not record_path.is_file():
         print(f"usage: record file {record_path} does not exist; run record first")
         return 2
-    models = read_record(record_path)
-    changed, reader = 0, RouteReader()
+    kinds = model_kinds()
+    models = read_record(record_path, kinds)
+    changed = 0
     for model, entry in models.items():
         try:
             if not Path(model).is_file():
                 lines = ["  file is missing"]
             else:
-                surface = kani_surface(Path(model), reader) if entry["kind"] == "kani" else SURFACES[entry["kind"]](Path(model))
-                lines = differences(entry["kind"], entry["surface"], surface)
-                if entry["kind"] == "kani":
-                    try:
-                        problems, names = compiled_problems(Path(model), surface, reader, entry.get("compiled"))
-                        lines += problems
-                        if names is not None and "compiled" not in entry:
-                            lines.append("  not checked against Kani at record, so compare cannot see a harness that "
-                                         "stopped compiling on a route that the record does not read")
-                    except ValueError as error:
-                        lines.append(f"  FAIL {error}")
+                lines = kinds[entry["kind"]].changes(entry, Path(model))
         except (OSError, ValueError, KeyError, TypeError) as error:
             lines = [f"  FAIL {error}"]
         changed += bool(lines)
