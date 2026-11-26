@@ -200,6 +200,19 @@ HIDDEN_ROUTES = [
         "lib.rs": '#[path = "proofs.rs"] mod readable;\n'
                   "macro_rules! call { ($mac:ident, $m:ident) => { builders::$mac!($m); }; }\ncall!(declare, proofs);\n"}),
 ]
+# Each crate invokes a macro that rustc resolves to a local one that declares no module, through a glob import, a
+# module path, and a definition that shadows one passing the name to the builders crate. Each records.
+READABLE_ROUTES = [
+    ("a/proofs.rs", {
+        "lib.rs": "mod a;\nmacro_rules! declare { ($m:ident) => { fn $m() {} } }\npub(crate) use declare;\n",
+        "a.rs": "mod proofs;\nuse super::*;\ndeclare!(proofs);\n"}),
+    ("proofs.rs", {
+        "lib.rs": "mod proofs;\nmod a;\na::declare!(proofs);\n",
+        "a.rs": "macro_rules! declare { ($m:ident) => { fn $m() {} } }\npub(crate) use declare;\n"}),
+    ("proofs.rs", {
+        "lib.rs": "mod proofs;\n#[allow(unused_macros)]\nmacro_rules! declare { ($m:ident) => { builders::declare!($m); } }\n"
+                  "macro_rules! declare { ($m:ident) => { fn $m() {} } }\ndeclare!(proofs);\n"}),
+]
 HARNESS = "#[kani::proof]\n#[kani::unwind(1)]\nfn check() {\n    assert!(1 + 1 == 2);\n}\n"
 
 
@@ -220,6 +233,10 @@ def kani_routes(work):
         write_crate(crate, {**files, harness: HARNESS}, '[dependencies]\nbuilders = { path = "../builders" }\n\n')
         refused = run(1, "baseline.py", "record", work / f"routes-{number}.json", crate / "src" / harness)
         assert f"Kani compiles {name} from this file, but no route that the record reads gives that name" in refused, refused
+    for number, (harness, files) in enumerate(READABLE_ROUTES):
+        crate = work / f"readable-{number}"
+        write_crate(crate, {**files, harness: HARNESS}, '[dependencies]\nbuilders = { path = "../builders" }\n\n')
+        run(0, "baseline.py", "record", work / f"readable-{number}.json", crate / "src" / harness)
     switched = work / "switched"
     write_crate(switched, {"lib.rs": '#[cfg(feature = "proofs")]\nmod proofs;\n', "proofs.rs": HARNESS})
     manifest = switched / "Cargo.toml"
