@@ -22,6 +22,7 @@ Usage: tlc-matrix.sh <matrix-file> [label-substring]
   JAVA=<path>        the java binary (default: java on PATH)
   TLC_WORKERS=<n>    TLC worker threads (default auto)
   TLC_TIMEOUT=<lim>  per-run time limit, e.g. 90s, 30m, 1h (default 60m)
+  TLC_HTML_REPORT=<path>  write a self-contained HTML report to this path
 
 Usage: tlc.py ready
   Checks TLC_TIMEOUT, that Java runs, and that the JAR is the pinned release or the one TLC_JAR names, then reports
@@ -54,6 +55,7 @@ sys.dont_write_bytecode = True
 import processes
 import runner
 import storage
+import tlc_report
 import tlc_trace
 
 CHECK_KINDS = ("INVARIANT", "INVARIANTS", "PROPERTY", "PROPERTIES")
@@ -621,6 +623,29 @@ class Runner:
         self.report(result)
 
 
+def validate_report_path(raw: str) -> Path | None:
+    """Validate TLC_HTML_REPORT path upfront before running TLC, or return None when unset."""
+    trimmed = raw.strip()
+    if not trimmed:
+        return None
+    path = Path(trimmed)
+    if path.is_dir():
+        raise ValueError(f"TLC_HTML_REPORT {path} is a directory")
+    if not path.parent.is_dir():
+        raise ValueError(f"TLC_HTML_REPORT parent directory {path.parent} does not exist")
+    if path.exists() and not path.is_file():
+        raise ValueError(f"TLC_HTML_REPORT {path} is not a regular file")
+    try:
+        fd, temp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    except OSError as error:
+        raise ValueError(f"TLC_HTML_REPORT {path} is not writable: {error}") from error
+    try:
+        os.close(fd)
+    finally:
+        Path(temp_path).unlink(missing_ok=True)
+    return path
+
+
 def main():
     if sys.argv[1:] == ["ready"]:
         print(f"READY TLC {Tlc().jar}")
@@ -632,6 +657,11 @@ def main():
     matrix, only = sys.argv[1], sys.argv[2] if len(sys.argv) == 3 else ""
     if not Path(matrix).is_file():
         print(f"FAIL {matrix} does not exist")
+        return 1
+    try:
+        report_path = validate_report_path(os.environ.get("TLC_HTML_REPORT", ""))
+    except ValueError as error:
+        print(f"FAIL {error}")
         return 1
     tlc = Tlc()
     with tempfile.TemporaryDirectory(dir=storage.ensure_temp_root()) as work:
@@ -645,7 +675,14 @@ def main():
     summary = f"SUMMARY {matrix_runner.passed} of {matrix_runner.runs_total} runs passed"
     if matrix_runner.reach_total:
         summary += f", {matrix_runner.reached} of {matrix_runner.reach_total} reach checks passed"
-    print(f"{summary}, {matrix_runner.states} distinct states in total")
+    summary_line = f"{summary}, {matrix_runner.states} distinct states in total"
+    print(summary_line)
+    if report_path is not None:
+        try:
+            tlc_report.write_html(report_path, Path(matrix).name, matrix_runner.results, summary_line, only=only)
+        except OSError as error:
+            print(f"FAIL TLC_HTML_REPORT {report_path}: {error}")
+            return 1
     return int(matrix_runner.failed)
 
 
