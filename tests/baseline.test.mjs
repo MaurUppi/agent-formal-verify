@@ -89,15 +89,15 @@ function routes(files, target) {
     "import json, sys",
     `sys.path.insert(0, ${JSON.stringify(scripts)})`,
     "from pathlib import Path",
-    "import baseline",
+    "import kani_reader",
     `crate, path = Path(${JSON.stringify(dir)}), Path(${JSON.stringify(join(dir, target))})`,
     "try:",
-    "    found = baseline.RouteReader().routes(path)",
+    "    found = kani_reader.RouteReader().routes(path)",
     "except ValueError as error:",
     "    print(json.dumps({'error': str(error).replace(str(crate), '<crate>')}))",
     "else:",
     "    routes = [[str(route.root.relative_to(crate)), route.guards, route.module] for route in found]",
-    "    print(json.dumps({'routes': routes, 'label': baseline.route_label(path, found)}))",
+    "    print(json.dumps({'routes': routes, 'label': kani_reader.route_label(path, found)}))",
   ].join("\n");
   const result = spawnSync("python3", ["-B", "-c", script], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
