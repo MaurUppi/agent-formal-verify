@@ -628,7 +628,7 @@ test("each harness that Kani compiles from a recorded file must be on a route th
 
   const readable = crate(["readable::a"]);
   assert.deepEqual(lines(baseline(readable.dir, "record", readable.record, readable.proofs)).slice(1), []);
-  assert.deepEqual(JSON.parse(readFileSync(readable.record, "utf8")).models[readable.proofs].compiled, ["readable::a"]);
+  assert.deepEqual(JSON.parse(readFileSync(readable.record, "utf8")).models[readable.proofs].compiled, ["harness a"]);
   assert.deepEqual(lines(baseline(readable.dir, "compare", readable.record)), [`UNCHANGED ${readable.proofs}`, "SUMMARY 1 unchanged, 0 changed"]);
   compiles(readable.dir, "src/proofs.rs", ["readable::a", "proofs::a"]);
   const added = lines(baseline(readable.dir, "compare", readable.record));
@@ -636,9 +636,9 @@ test("each harness that Kani compiles from a recorded file must be on a route th
   assert.ok(added[1].startsWith(`  FAIL ${hiddenRoute}`), added[1]);
   // A cfg that the text does not show, such as a default feature removed from Cargo.toml, switches the harness off.
   compiles(readable.dir, "src/proofs.rs", []);
-  assert.deepEqual(lines(baseline(readable.dir, "compare", readable.record)), [`CHANGED ${readable.proofs}`, "  not compiled readable::a", "SUMMARY 0 unchanged, 1 changed"]);
+  assert.deepEqual(lines(baseline(readable.dir, "compare", readable.record)), [`CHANGED ${readable.proofs}`, "  not compiled harness a", "SUMMARY 0 unchanged, 1 changed"]);
   rmSync(join(readable.dir, "Cargo.toml"));
-  assert.deepEqual(lines(baseline(readable.dir, "compare", readable.record)), [`CHANGED ${readable.proofs}`, "  not compiled readable::a", "SUMMARY 0 unchanged, 1 changed"]);
+  assert.deepEqual(lines(baseline(readable.dir, "compare", readable.record)), [`CHANGED ${readable.proofs}`, "  not compiled harness a", "SUMMARY 0 unchanged, 1 changed"]);
 
   // Without Kani a harness file is recorded from its text alone, and compare cannot pass it.
   const missing = crate([]);
@@ -650,6 +650,23 @@ test("each harness that Kani compiles from a recorded file must be on a route th
   const failed = baseline(missing.dir, "compare", missing.record);
   assert.equal(failed.status, 1);
   assert.match(lines(failed)[1], /^ {2}FAIL cannot ask Kani which harnesses it compiles in .*UNAVAILABLE Kani/);
+
+  // A closure or a const _ block adds an anonymous segment to Kani's name, which is not a route.
+  const closure = crate(["readable::f::{closure#0}::g", "readable::f::_::h"]);
+  writeFileSync(closure.proofs, "fn f() {\n    let _c = || {\n        #[kani::proof]\n        fn g() {}\n    };\n    const _: () = {\n        #[kani::proof]\n        fn h() {}\n    };\n}\n");
+  assert.equal(baseline(closure.dir, "record", closure.record, closure.proofs).status, 0);
+  assert.deepEqual(JSON.parse(readFileSync(closure.record, "utf8")).models[closure.proofs].compiled, ["harness f::g", "harness f::h"]);
+
+  // move carries the compiled harnesses to the new file, renamed with --module, so compare still reports one switched off.
+  const moved = crate(["readable::a"]);
+  assert.equal(baseline(moved.dir, "record", moved.record, moved.proofs).status, 0);
+  const checks = join(moved.dir, "src/checks.rs");
+  writeFileSync(checks, "mod inner {\n    #[kani::proof]\n    fn a() {}\n}\n");
+  writeFileSync(join(moved.dir, "src/lib.rs"), '#[path = "checks.rs"] mod readable;\n');
+  assert.equal(baseline(moved.dir, "move", moved.record, moved.proofs, checks, "--module", "crate", "inner").status, 0);
+  assert.deepEqual(JSON.parse(readFileSync(moved.record, "utf8")).models[checks].compiled, ["harness inner::a"]);
+  compiles(moved.dir, "src/checks.rs", []);
+  assert.deepEqual(lines(baseline(moved.dir, "compare", moved.record)), [`CHANGED ${checks}`, "  not compiled harness inner::a", "SUMMARY 0 unchanged, 1 changed"]);
 });
 
 test("a route to a Kani harness file through include! is followed, and one that a macro may build fails the record", () => {

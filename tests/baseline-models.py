@@ -228,7 +228,7 @@ def kani_routes(work):
     run(0, "baseline.py", "record", record, switched / "src/proofs.rs")
     run(0, "baseline.py", "compare", record)
     manifest.write_text(manifest.read_text().replace('default = ["proofs"]', "default = []"))
-    assert "  not compiled proofs::check\n" in run(1, "baseline.py", "compare", record)
+    assert "  not compiled harness check\n" in run(1, "baseline.py", "compare", record)
 
 
 with tempfile.TemporaryDirectory(prefix="formal-baseline-") as directory:

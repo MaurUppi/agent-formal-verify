@@ -19,8 +19,9 @@ change, and so is an added item whose kind narrows what is checked.
                #[path], and each kani::assume, kani::any_where, kani::cover! and
                #[kani::stub] with its owning free function, under inline modules. Unsupported owners fail. Added covers and harnesses are allowed.
                Added assumes and stubs are changes.
-               In a Cargo package, also the harnesses that Kani compiles from the file, each of which must sit
-               on a route the record reads; one that no longer compiles is a change.
+               In a Cargo package, also the recorded harnesses that Kani compiles from the file; Kani must give
+               each harness it compiles there a module path that a route the record reads gives, and a harness
+               that no longer compiles is a change.
 
 Usage:
   baseline.py record <record-file> <model-file>...   record these files, keep the other entries
@@ -50,6 +51,7 @@ sys.dont_write_bytecode = True
 
 import kani
 import runner
+import storage
 import tlc
 from lean_records import read_record as read_lean_record
 
@@ -1277,34 +1279,43 @@ def compiled_in(package):
         ValueError: Kani is not installed, or cannot compile the package.
     """
     try:
-        with tempfile.TemporaryDirectory(prefix="baseline-kani-") as work:
+        with tempfile.TemporaryDirectory(prefix="baseline-kani-", dir=storage.ensure_temp_root()) as work:
             return tuple(kani.compiled(package, Path(work), checker()))
     except (kani.CheckError, runner.Unavailable) as error:
         raise ValueError(f"cannot ask Kani which harnesses it compiles in {package}: {error}") from error
 
 
+# A closure or a `const _` block puts an anonymous segment in Kani's name for a harness inside it.
+ANONYMOUS = re.compile(r"\{\w+#\d+\}|_")
+
+
+def item_path(name):
+    return "::".join(part.removeprefix("r#") for part in name.split("::") if not ANONYMOUS.fullmatch(part))
+
+
 def compiled_problems(path, surface, recorded=None):
     """Return the lines on which the harnesses that Kani compiles from path disagree with surface and recorded, and
-    the names of those harnesses, or None for them when no Cargo package holds path.
+    surface's harnesses that it compiles, as `harness <owner>` items, or None for them when no Cargo package holds
+    path.
 
     Each harness that Kani compiles from path must be one of surface's harnesses under the module path of a route
-    that the record reads, so that its recorded guards are the ones that decide whether it compiles. A name in
-    recorded that Kani no longer compiles is a harness that was switched off.
+    that the record reads. A harness in recorded that Kani compiles on no route is a harness that was switched off.
 
     Raises:
         ValueError: Kani is not installed, or cannot compile the package.
     """
     package = next((folder for folder in path.parents if (folder / "Cargo.toml").is_file()), None)
     if package is None:
-        return [f"  not compiled {name}" for name in recorded or ()], None
-    names = {harness.name.replace("r#", "") for harness in compiled_in(package) if harness.source == path}
+        return [f"  not compiled {item}" for item in recorded or ()], None
+    names = {item_path(harness.name) for harness in compiled_in(package) if harness.source == path}
     _, modules = declaration_guards(path)
     owners = {re.sub(r"\[\d+\]$", "", KANI_KEY.fullmatch(item)[2]) for item in surface if item.startswith("harness ")}
-    expected = {"::".join(filter(None, (module, owner))).replace("r#", "") for module in modules for owner in owners}
+    expected = {item_path("::".join(filter(None, (module, owner)))): owner for module in modules for owner in owners}
     lines = [f"  FAIL Kani compiles {name} from this file, but no route that the record reads gives that name; declare "
-             "the module with `mod <name>;` or `#[path = \"...\"]` outside macros and function bodies" for name in sorted(names - expected)]
-    lines += [f"  not compiled {name}" for name in sorted(set(recorded or ()) - names)]
-    return lines, sorted(names)
+             "the module with `mod <name>;` or `#[path = \"...\"]` outside macros and function bodies" for name in sorted(names - expected.keys())]
+    compiled = sorted({f"harness {expected[name]}" for name in names & expected.keys()})
+    lines += [f"  not compiled {item}" for item in sorted(set(recorded or ()) - set(compiled))]
+    return lines, compiled
 
 
 SURFACES = {"lean": lean_surface, "tla": tla_surface, "kani": kani_surface}
@@ -1398,14 +1409,20 @@ def move(record_path, old_file, new_file, module):
     if module and kind != "kani":
         print("usage: --module applies only to a Kani harness file")
         return 2
-    surface = models.pop(old)["surface"]
+    entry = models.pop(old)
+    surface, compiled = entry["surface"], entry.get("compiled")
     if module:
         surface = renamed(surface, *module)
+        compiled = compiled and list(renamed(dict.fromkeys(compiled), *module))
     if new in models:
         if overlap := surface.keys() & models[new]["surface"].keys():
             raise ValueError(f"{new} already records {', '.join(sorted(overlap))}")
         surface = {**models[new]["surface"], **surface}
+        if "compiled" in models[new]:
+            compiled = [*models[new]["compiled"], *(compiled or [])]
     models[new] = {"kind": kind, "digest": digest(surface), "surface": surface}
+    if compiled is not None:
+        models[new]["compiled"] = sorted(compiled)
     write_record(record_path, models)
     print(f"MOVED {old} -> {new}")
     return 0
@@ -1475,9 +1492,14 @@ def main():
     return compare(arguments.record_file)
 
 
-if __name__ == "__main__":
+def guarded_main():
     try:
-        sys.exit(main())
+        return main()
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"FAIL baseline: {error}")
-        sys.exit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    # The runner turns a stopping signal into an exception, so Kani's work directory is removed before the exit.
+    runner.run(guarded_main)
