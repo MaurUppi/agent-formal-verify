@@ -1,6 +1,6 @@
 # Changes
 
-## Unreleased
+## 0.4.13 - baseline routes checked against the harnesses Kani compiles
 
 `scripts/baseline.py` reads a route to a Kani harness file only through `mod` declarations, `#[path]` attributes and `include!` items outside macros and function bodies. It does not guess from source text whether a macro, an attribute macro or an `include!` that it cannot read builds another route. The check against the harnesses that Kani compiles covers such a route, so `#[path = "proofs.rs"] mod readable;` beside `cfg_if::cfg_if! { if #[cfg(kani)] { mod proofs; } }` fails `record` with the name that Kani gives the harness on the route inside the macro, such as `proofs::a`. When Kani cannot run at `record`, `compare` makes the check. A route inside a function body, an inline module in one included, and one through a `const _` block, are routes that the record does not read. A harness file outside any Cargo package gets no such check.
 
