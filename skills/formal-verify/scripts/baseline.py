@@ -19,6 +19,8 @@ change, and so is an added item whose kind narrows what is checked.
                #[path], and each kani::assume, kani::any_where, kani::cover! and
                #[kani::stub] with its owning free function, under inline modules. Unsupported owners fail. Added covers and harnesses are allowed.
                Added assumes and stubs are changes.
+               In a Cargo package, also the harnesses that Kani compiles from the file, each of which must sit
+               on a route the record reads; one that no longer compiles is a change.
 
 Usage:
   baseline.py record <record-file> <model-file>...   record these files, keep the other entries
@@ -34,16 +36,19 @@ file that fails to parse, 2 usage error.
 """
 import argparse
 import bisect
+import functools
 import hashlib
 import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import NamedTuple
 
 sys.dont_write_bytecode = True
 
+import kani
 import runner
 import tlc
 from lean_records import read_record as read_lean_record
@@ -1153,10 +1158,11 @@ def hidden_declaration(file, parsed, path, builders, macros, scope, package):
 
 def declaration_guards(path):
     """Return the guards on the out-of-line `mod` declarations that lead to path from its crate roots, outermost
-    first. A crate root is one route without guards, since its own crate always compiles it, unless it is a lib.rs
-    or main.rs that Cargo does not name and another file declares, which makes it a module. For more than one
-    route, return `routes(...)` with each route as its crate root's path relative to path's directory, a colon and
-    its guards, or `unguarded` for a route without any, sorted and separated by `; `.
+    first, and the module path that each route gives path's items, with "" for a crate root. A crate root is one
+    route without guards, since its own crate always compiles it, unless it is a lib.rs or main.rs that Cargo does
+    not name and another file declares, which makes it a module. For more than one route, the guards are
+    `routes(...)` with each route as its crate root's path relative to path's directory, a colon and its guards,
+    or `unguarded` for a route without any, sorted and separated by `; `.
 
     It follows each declaration from the crate roots by rustc's rules, including `#[path = "..."]` and each path
     that a cfg_attr may set, and each `include!("...")` item. It fails for a file that no root reaches, for a module
@@ -1164,11 +1170,11 @@ def declaration_guards(path):
     there that may build one, such as an invocation of a macro from another crate that names path's module.
     """
     if (crates := crate_roots(path)) is None:
-        return ""
+        return "", {""}
     roots, named = crates
     edges, broken, packages = module_tree(roots)
     if path in roots and path not in edges:
-        return ""
+        return "", {""}
     module = path.parent.name if path.name == "mod.rs" else path.stem
     for message, text in broken:
         if text is None or re.search(rf"\b{re.escape(module)}\b|{re.escape(path.name)}", text):
@@ -1195,21 +1201,26 @@ def declaration_guards(path):
 
     def routes(file, visiting):
         root = file in named or file in roots and all(declarer == file for declarer, _ in edges.get(file, ()))
-        found = [(file, "")] if root else []
+        found = [(file, "", "")] if root else []
         for declarer, declaration in edges.get(file, ()):
             if declarer in visiting:
                 continue
             parsed = parse_rust(declarer)
-            items = [(0, 0, -1)] + [(module.start, module.keyword, module.body) for module in enclosing_modules(parsed, declaration)] + [(declaration.start, declaration.keyword, declaration.body)]
+            enclosing = enclosing_modules(parsed, declaration)
+            items = [(0, 0, -1)] + [(module.start, module.keyword, module.body) for module in enclosing] + [(declaration.start, declaration.keyword, declaration.body)]
             guards = cfg_guards(parsed.source, items)
-            found += [(start, " ".join(filter(None, (route, guards)))) for start, route in routes(declarer, visiting | {declarer})]
+            # An included file's items sit in the modules around the include!; a declared file's in its module.
+            local = (enclosing[-1].name if enclosing else "") if declaration in parsed.includes else declaration.name
+            found += [(start, " ".join(filter(None, (route, guards))), "::".join(filter(None, (module, local))))
+                      for start, route, module in routes(declarer, visiting | {declarer})]
         return found
 
-    found = sorted((os.path.relpath(root, path.parent), guards) for root, guards in routes(path, {path}))
-    if len(found) == 1:
-        return found[0][1]
-    labelled = "; ".join(f"{root}: {guards or 'unguarded'}" for root, guards in found)
-    return f"routes({labelled})"
+    found = routes(path, {path})
+    modules = {module.replace("r#", "") for _, _, module in found}
+    labelled = sorted((os.path.relpath(root, path.parent), guards) for root, guards, _ in found)
+    if len(labelled) == 1:
+        return labelled[0][1], modules
+    return "routes({})".format("; ".join(f"{root}: {guards or 'unguarded'}" for root, guards in labelled)), modules
 
 
 def kani_surface(path):
@@ -1218,7 +1229,7 @@ def kani_surface(path):
     if renaming := RENAMING_IMPORT.search(mask):
         raise ValueError(f"{path}: '{collapse(renaming[0])}' brings a Kani assumption, cover, stub or harness attribute in under another name; write each as kani::<name> so the record can read it")
     functions, modules, opaque, _, _ = rust_functions(mask)
-    declared = declaration_guards(path)
+    declared, _ = declaration_guards(path)
 
     def owner_at(position, *, attribute=False):
         if not any(start <= position < end for start, end in opaque):
@@ -1252,6 +1263,49 @@ def kani_surface(path):
     return surface
 
 
+@functools.cache
+def checker():
+    return kani.Kani()
+
+
+@functools.cache
+def compiled_in(package):
+    """Return each harness that Kani compiles in the Cargo package at package, as (name, source file).
+
+    Raises:
+        ValueError: Kani is not installed, or cannot compile the package.
+    """
+    try:
+        with tempfile.TemporaryDirectory(prefix="baseline-kani-") as work:
+            return tuple((harness.name.replace("r#", ""), harness.source) for harness in kani.compiled(package, Path(work), checker()))
+    except (kani.CheckError, runner.Unavailable) as error:
+        raise ValueError(f"cannot ask Kani which harnesses it compiles in {package}: {error}") from error
+
+
+def compiled_problems(path, surface, recorded=None):
+    """Return the lines on which the harnesses that Kani compiles from path disagree with surface and recorded, and
+    the names of those harnesses, or None for them when no Cargo package holds path.
+
+    Each harness that Kani compiles from path must be one of surface's harnesses under the module path of a route
+    that the record reads, so that its recorded guards are the ones that decide whether it compiles. A name in
+    recorded that Kani no longer compiles is a harness that was switched off.
+
+    Raises:
+        ValueError: Kani is not installed, or cannot compile the package.
+    """
+    package = next((folder for folder in path.parents if (folder / "Cargo.toml").is_file()), None)
+    if package is None:
+        return [f"  not compiled {name}" for name in recorded or ()], None
+    names = {name for name, source in compiled_in(package) if source == path}
+    _, modules = declaration_guards(path)
+    owners = {re.sub(r"\[\d+\]$", "", KANI_KEY.fullmatch(item)[2]).replace("r#", "") for item in surface if item.startswith("harness ")}
+    expected = {"::".join(filter(None, (module, owner))) for module in modules for owner in owners}
+    lines = [f"  FAIL Kani compiles {name} from this file, but no route that the record reads gives that name; declare "
+             "the module with `mod <name>;` or `#[path = \"...\"]` outside macros and function bodies" for name in sorted(names - expected)]
+    lines += [f"  not compiled {name}" for name in sorted(set(recorded or ()) - names)]
+    return lines, sorted(names)
+
+
 SURFACES = {"lean": lean_surface, "tla": tla_surface, "kani": kani_surface}
 
 
@@ -1267,6 +1321,8 @@ def read_record(path):
     for model, entry in models.items():
         if not isinstance(entry, dict) or entry.get("kind") not in SURFACES or not isinstance(entry.get("surface"), dict):
             raise ValueError(f"{path}: malformed entry for {model}")
+        if not isinstance(entry.get("compiled", []), list) or not all(isinstance(name, str) for name in entry.get("compiled", [])):
+            raise ValueError(f"{path}: malformed entry for {model}")
     return models
 
 
@@ -1281,16 +1337,30 @@ def record(record_path, files):
             print(f"usage: {file} has no model surface; expected one of {', '.join(KINDS)}")
             return 2
     models = read_record(record_path) if record_path.exists() else {}
-    updates = {}
+    updates, notes = {}, {}
     for file in files:
         kind = KINDS[file.suffix]
         surface = SURFACES[kind](file.resolve())
-        updates[str(file.resolve())] = {"kind": kind, "digest": digest(surface), "surface": surface}
+        entry = {"kind": kind, "digest": digest(surface), "surface": surface}
+        if kind == "kani":
+            # A harness that no longer compiles is recorded from its text alone; compare asks Kani again.
+            try:
+                problems, names = compiled_problems(file.resolve(), surface)
+            except ValueError as error:
+                notes[str(file.resolve())] = f"  not checked against Kani: {error}"
+            else:
+                if problems:
+                    raise ValueError(f"{file.resolve()}: " + "; ".join(problem.strip().removeprefix("FAIL ") for problem in problems))
+                if names is not None:
+                    entry["compiled"] = names
+        updates[str(file.resolve())] = entry
     for model, entry in updates.items():
         print(f"RECORDED {model} {entry['digest']}")
         previous = models.get(model, {}).get("digest")
         if previous and previous != entry["digest"]:
             print(f"  previous {previous}")
+        if model in notes:
+            print(notes[model])
     write_record(record_path, {**models, **updates})
     return 0
 
@@ -1365,7 +1435,13 @@ def compare(record_path):
             if not Path(model).is_file():
                 lines = ["  file is missing"]
             else:
-                lines = differences(entry["kind"], entry["surface"], SURFACES[entry["kind"]](Path(model)))
+                surface = SURFACES[entry["kind"]](Path(model))
+                lines = differences(entry["kind"], entry["surface"], surface)
+                if entry["kind"] == "kani":
+                    try:
+                        lines += compiled_problems(Path(model), surface, entry.get("compiled"))[0]
+                    except ValueError as error:
+                        lines.append(f"  FAIL {error}")
         except (OSError, ValueError, KeyError, TypeError) as error:
             lines = [f"  FAIL {error}"]
         changed += bool(lines)

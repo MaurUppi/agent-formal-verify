@@ -158,10 +158,84 @@ mod proofs {
     run(0, "kani-check.sh", project)
 
 
+BUILDERS = """#[macro_export]
+macro_rules! declare { ($m:ident) => { mod $m; }; }
+#[macro_export]
+macro_rules! declare_at { ($m:ident, $p:literal) => { #[path = $p] mod $m; }; }
+"""
+CALL_PATH = "macro_rules! call { ($mac:path, $m:ident) => { $mac!($m); }; }\n"
+# Each crate compiles src/<harness> a second time through a macro from the builders crate, as the open baseline.py
+# macro issues show, beside a #[path] route that the record reads. Kani names the harness on the second route.
+HIDDEN_ROUTES = [
+    ("a::proofs::check", "a/proofs.rs", {
+        "lib.rs": '#[path = "a/proofs.rs"] mod readable;\nmod other;\nmod a;\npub use builders::declare;\n',
+        "a.rs": "use crate::declare;\ndeclare!(proofs);\n",
+        "other.rs": "#[allow(unused_macros)]\nmacro_rules! declare { ($m:ident) => { struct $m; } }\n"}),
+    ("proofs::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\n'
+                  "macro_rules! w { () => { macro_rules! v { () => { builders::declare!(proofs); } } v!(); }; }\nw!();\n"}),
+    ("x::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\n'
+                  'macro_rules! w { () => { macro_rules! v { () => { builders::declare_at!(x, "proofs.rs"); } } v!(); }; }\nw!();\n'}),
+    ("a::proofs::check", "a/proofs.rs", {
+        "lib.rs": '#[path = "a/proofs.rs"] mod readable;\nmod other;\nmacro_rules! w { ($m:ident) => { declare!($m); } }\nmod a;\n',
+        "other.rs": "#[allow(unused_macros)]\nmacro_rules! declare { ($m:ident) => { struct $m; } }\n",
+        "a.rs": "use builders::declare;\nw!(proofs);\n"}),
+    ("proofs::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\n' + CALL_PATH
+                  + "macro_rules! via { ($($t:tt)*) => { call!($($t)*); }; }\nvia!(builders::declare, proofs);\n"}),
+    ("proofs::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\n' + CALL_PATH
+                  + "macro_rules! via { ($m:ident) => { call!(builders::declare, $m); }; }\nvia!(proofs);\n"}),
+    ("proofs::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\n' + CALL_PATH
+                  + "macro_rules! outer { () => { call!(builders::declare, proofs); }; }\nouter!();\n"}),
+    ("proofs::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\n'
+                  "macro_rules! call { ($($mac:ident)::+, $m:ident) => { $($mac)::+!($m); }; }\ncall!(builders::declare, proofs);\n"}),
+    ("proofs::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\nuse builders::declare;\n'
+                  "macro_rules! call { ($mac:ident $bang:tt $m:ident) => { $mac $bang ($m); }; }\ncall!(declare ! proofs);\n"}),
+    ("proofs::check", "proofs.rs", {
+        "lib.rs": '#[path = "proofs.rs"] mod readable;\n'
+                  "macro_rules! call { ($mac:ident, $m:ident) => { builders::$mac!($m); }; }\ncall!(declare, proofs);\n"}),
+]
+HARNESS = "#[kani::proof]\n#[kani::unwind(1)]\nfn check() {\n    assert!(1 + 1 == 2);\n}\n"
+
+
+def write_crate(directory, files, dependencies=""):
+    manifest = (EXAMPLES / "kani-template/Cargo.toml").read_text().replace('name = "bounded-queue"', f'name = "{directory.name}"')
+    (directory / "src").mkdir(parents=True)
+    (directory / "Cargo.toml").write_text(manifest.replace("[lints.rust]", f"{dependencies}[lints.rust]"))
+    for name, text in files.items():
+        (directory / "src" / name).parent.mkdir(parents=True, exist_ok=True)
+        (directory / "src" / name).write_text(text)
+
+
+def kani_routes(work):
+    """Kani's own harness list decides whether a harness compiles through a route the record does not read."""
+    write_crate(work / "builders", {"lib.rs": BUILDERS})
+    for number, (name, harness, files) in enumerate(HIDDEN_ROUTES):
+        crate = work / f"routes-{number}"
+        write_crate(crate, {**files, harness: HARNESS}, '[dependencies]\nbuilders = { path = "../builders" }\n\n')
+        refused = run(1, "baseline.py", "record", work / f"routes-{number}.json", crate / "src" / harness)
+        assert f"Kani compiles {name} from this file, but no route that the record reads gives that name" in refused, refused
+    switched = work / "switched"
+    write_crate(switched, {"lib.rs": '#[cfg(feature = "proofs")]\nmod proofs;\n', "proofs.rs": HARNESS})
+    manifest = switched / "Cargo.toml"
+    manifest.write_text(manifest.read_text() + '\n[features]\ndefault = ["proofs"]\nproofs = []\n')
+    record = work / "switched.json"
+    run(0, "baseline.py", "record", record, switched / "src/proofs.rs")
+    run(0, "baseline.py", "compare", record)
+    manifest.write_text(manifest.read_text().replace('default = ["proofs"]', "default = []"))
+    assert "  not compiled proofs::check\n" in run(1, "baseline.py", "compare", record)
+
+
 with tempfile.TemporaryDirectory(prefix="formal-baseline-") as directory:
     tla_layout(Path(directory))
     matrix_order(Path(directory))
     imported_property(Path(directory))
     fairness_subscript(Path(directory))
     kani_ownership(Path(directory))
+    kani_routes(Path(directory))
 print("ok: the baseline rejects narrowed checks and assumptions even when the real verifiers pass")

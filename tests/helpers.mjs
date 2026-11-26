@@ -41,6 +41,30 @@ export function command(dir, name, body) {
   chmodSync(path, 0o755);
   return path;
 }
+export const KANI = "0.68.0";
+export const TOOLCHAIN = "nightly-2026-08-21-aarch64-apple-darwin";
+export const bundle = (dir) => join(dir, `kani/kani-${KANI}`);
+export const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).stdout.trim();
+export const writeJson = (path, value) => writeFileSync(path, JSON.stringify(value));
+// Behaves as the pinned kani-driver, configured by driver.json and report.json in the fixture directory.
+export const DRIVER = readFileSync(join(logs, "kani-driver.py"), "utf8");
+// Install a fake Kani bundle at dir/kani, for KANI_HOME, that driver.json in dir configures.
+export function installKani(dir, config = {}) {
+  for (const path of ["bin/kani-compiler", "bin/cbmc", "toolchain/bin/rustc", "toolchain/bin/cargo"]) {
+    const file = join(bundle(dir), path);
+    mkdirSync(join(file, ".."), { recursive: true });
+    writeFileSync(file, "#!/bin/sh\nexit 0\n");
+    chmodSync(file, 0o755);
+  }
+  for (const executable of ["bin/kani-driver", "toolchain/bin/cargo"]) {
+    const path = join(bundle(dir), executable);
+    writeFileSync(path, `#!${python}\n${DRIVER}`);
+    chmodSync(path, 0o755);
+  }
+  writeFileSync(join(bundle(dir), "rust-toolchain-version"), `${TOOLCHAIN}\n`);
+  writeJson(join(dir, "driver.json"), { version: KANI, harnesses: {}, ...config });
+  return dir;
+}
 export function fakeTlc(dir, body) {
   return command(dir, "tlc-java", '[[ "$*" == *"-help"* ]] && exit 0\n[ "$1" = "-version" ] && exit 0\n' + body);
 }

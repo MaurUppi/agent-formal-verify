@@ -2,41 +2,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { afterEach, test } from "node:test";
-import { command, excludes, fixture, includes, logs, removeFixtures, run, scripts } from "./helpers.mjs";
+import { bundle, command, DRIVER, excludes, fixture, includes, installKani, KANI, logs, python, removeFixtures, run, scripts, TOOLCHAIN, writeJson } from "./helpers.mjs";
 
 afterEach(removeFixtures);
 
-const KANI = "0.68.0";
-const TOOLCHAIN = "nightly-2026-08-21-aarch64-apple-darwin";
-const bundle = (dir) => join(dir, `kani/kani-${KANI}`);
-const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).stdout.trim();
-const writeJson = (path, value) => writeFileSync(path, JSON.stringify(value));
 const calls = (dir) => (existsSync(join(dir, "calls")) ? readFileSync(join(dir, "calls"), "utf8") : "");
 const runKani = (dir, script, args = [], extra = {}) => run(dir, script, args, { KANI_HOME: join(dir, "kani"), ...extra });
 
-// Behaves as the pinned kani-driver, configured by driver.json and report.json in the fixture directory.
-const DRIVER = readFileSync(join(logs, "kani-driver.py"), "utf8");
-
-function kaniBundle(config = {}) {
-  const dir = fixture();
-  for (const path of ["bin/kani-compiler", "bin/cbmc", "toolchain/bin/rustc", "toolchain/bin/cargo"]) {
-    const file = join(bundle(dir), path);
-    mkdirSync(join(file, ".."), { recursive: true });
-    writeFileSync(file, "#!/bin/sh\nexit 0\n");
-    chmodSync(file, 0o755);
-  }
-  for (const executable of ["bin/kani-driver", "toolchain/bin/cargo"]) {
-    const path = join(bundle(dir), executable);
-    writeFileSync(path, `#!${python}\n${DRIVER}`);
-    chmodSync(path, 0o755);
-  }
-  writeFileSync(join(bundle(dir), "rust-toolchain-version"), `${TOOLCHAIN}\n`);
-  writeJson(join(dir, "driver.json"), { version: KANI, harnesses: {}, ...config });
-  return dir;
-}
+const kaniBundle = (config = {}) => installKani(fixture(), config);
 
 function kaniFixture(outcome = "success", config = {}) {
   const report = JSON.parse(readFileSync(join(logs, `kani-${outcome}.json`), "utf8"));

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { copyFileSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import { fixture, removeFixtures, root, run } from "./helpers.mjs";
+import { fixture, installKani, removeFixtures, root, run } from "./helpers.mjs";
 
 afterEach(removeFixtures);
 
@@ -28,7 +28,8 @@ function models() {
   return { dir, ...paths };
 }
 
-const baseline = (dir, ...args) => run(dir, "baseline.py", args);
+// Kani is the fake that a test installs at dir/kani, or absent, whatever this machine has installed.
+const baseline = (dir, ...args) => run(dir, "baseline.py", args, { KANI_HOME: join(dir, "kani") });
 const lines = (result) => result.stdout.split("\n").filter(Boolean);
 
 function edit(path, from, to) {
@@ -551,12 +552,14 @@ test("a cfg on a #[path] declaration or in another crate root that leads to a Ka
 
 test("removing or guarding one of several routes to a Kani harness file is changed", () => {
   const harness = "#[kani::proof]\nfn a() { kani::cover!(true); }\n";
-  const recorded = (files, target = "src/proofs.rs") => {
+  // compiled names the harnesses that Kani compiles from target.
+  const recorded = (files, target = "src/proofs.rs", compiled = ["proofs::a"]) => {
     const dir = realpathSync(fixture());
     for (const [name, text] of Object.entries({ "Cargo.toml": '[package]\nname = "p"\nversion = "0.1.0"\n', ...files, [target]: harness })) {
       mkdirSync(join(dir, name, ".."), { recursive: true });
       writeFileSync(join(dir, name), text);
     }
+    installKani(dir, { harnesses: Object.fromEntries(compiled.map((name) => [name, 1])), harnessSources: Object.fromEntries(compiled.map((name) => [name, target])) });
     const record = join(dir, "record.json");
     const proofs = join(dir, target);
     assert.equal(baseline(dir, "record", record, proofs).status, 0);
@@ -597,8 +600,54 @@ test("removing or guarding one of several routes to a Kani harness file is chang
   const root = recorded({ "src/lib.rs": "mod proofs;\n", "src/main.rs": '#[cfg(z)] #[path = "lib.rs"] mod lib;\nfn main() {}\n' });
   assert.equal(root.guards, "routes(lib.rs: unguarded; main.rs: cfg(z))");
 
-  const module = recorded({ "src/lib.rs": '#[cfg(feature = "x")] mod a;\n', "src/a/mod.rs": "mod main;\n", "src/a/main.rs": "mod proofs;\n" }, "src/a/main/proofs.rs");
+  const module = recorded({ "src/lib.rs": '#[cfg(feature = "x")] mod a;\n', "src/a/mod.rs": "mod main;\n", "src/a/main.rs": "mod proofs;\n" }, "src/a/main/proofs.rs", []);
   assert.equal(module.guards, 'cfg(feature = "x")');
+});
+
+test("each harness that Kani compiles from a recorded file must be on a route the record reads, and must keep compiling", () => {
+  const files = { "Cargo.toml": '[package]\nname = "p"\nversion = "0.1.0"\n', "src/lib.rs": '#[path = "proofs.rs"] mod readable;\n', "src/proofs.rs": "#[kani::proof]\nfn a() {}\n" };
+  const crate = (compiled) => {
+    const dir = realpathSync(fixture());
+    for (const [name, text] of Object.entries(files)) {
+      mkdirSync(join(dir, name, ".."), { recursive: true });
+      writeFileSync(join(dir, name), text);
+    }
+    kani(dir, compiled);
+    return { dir, record: join(dir, "record.json"), proofs: join(dir, "src/proofs.rs") };
+  };
+  const kani = (dir, compiled) => installKani(dir, { harnesses: Object.fromEntries(compiled.map((name) => [name, 1])), harnessSources: Object.fromEntries(compiled.map((name) => [name, "src/proofs.rs"])) });
+  const hiddenRoute = "Kani compiles proofs::a from this file, but no route that the record reads gives that name";
+
+  // A macro such as builders::declare!(proofs) compiles the file a second time, as proofs, which the record cannot read.
+  const hidden = crate(["readable::a", "proofs::a"]);
+  const refused = baseline(hidden.dir, "record", hidden.record, hidden.proofs);
+  assert.equal(refused.status, 1);
+  assert.equal(refused.stdout, `FAIL baseline: ${hidden.proofs}: ${hiddenRoute}; declare the module with \`mod <name>;\` or \`#[path = "..."]\` outside macros and function bodies\n`);
+
+  const readable = crate(["readable::a"]);
+  assert.deepEqual(lines(baseline(readable.dir, "record", readable.record, readable.proofs)).slice(1), []);
+  assert.deepEqual(JSON.parse(readFileSync(readable.record, "utf8")).models[readable.proofs].compiled, ["readable::a"]);
+  assert.deepEqual(lines(baseline(readable.dir, "compare", readable.record)), [`UNCHANGED ${readable.proofs}`, "SUMMARY 1 unchanged, 0 changed"]);
+  kani(readable.dir, ["readable::a", "proofs::a"]);
+  const added = lines(baseline(readable.dir, "compare", readable.record));
+  assert.equal(added[0], `CHANGED ${readable.proofs}`);
+  assert.ok(added[1].startsWith(`  FAIL ${hiddenRoute}`), added[1]);
+  // A cfg that the text does not show, such as a default feature removed from Cargo.toml, switches the harness off.
+  kani(readable.dir, []);
+  assert.deepEqual(lines(baseline(readable.dir, "compare", readable.record)), [`CHANGED ${readable.proofs}`, "  not compiled readable::a", "SUMMARY 0 unchanged, 1 changed"]);
+  rmSync(join(readable.dir, "Cargo.toml"));
+  assert.deepEqual(lines(baseline(readable.dir, "compare", readable.record)), [`CHANGED ${readable.proofs}`, "  not compiled readable::a", "SUMMARY 0 unchanged, 1 changed"]);
+
+  // Without Kani a harness file is recorded from its text alone, and compare cannot pass it.
+  const missing = crate([]);
+  rmSync(join(missing.dir, "kani"), { recursive: true });
+  const unchecked = lines(baseline(missing.dir, "record", missing.record, missing.proofs));
+  assert.equal(unchecked.length, 2);
+  assert.match(unchecked[1], new RegExp(`^ {2}not checked against Kani: cannot ask Kani which harnesses it compiles in ${missing.dir}: UNAVAILABLE Kani`));
+  assert.equal(JSON.parse(readFileSync(missing.record, "utf8")).models[missing.proofs].compiled, undefined);
+  const failed = baseline(missing.dir, "compare", missing.record);
+  assert.equal(failed.status, 1);
+  assert.match(lines(failed)[1], /^ {2}FAIL cannot ask Kani which harnesses it compiles in .*UNAVAILABLE Kani/);
 });
 
 test("a route to a Kani harness file through include! is followed, and one that a macro may build fails the record", () => {

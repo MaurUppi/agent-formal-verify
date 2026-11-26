@@ -53,6 +53,13 @@ class Harness:
 
 
 @dataclass(frozen=True)
+class Compiled:
+    name: str
+    source: Path
+    attributes: dict
+
+
+@dataclass(frozen=True)
 class Outcome:
     verdict: Verdict
     checks: int
@@ -205,8 +212,11 @@ def read_json(path):
         raise CheckError(f"missing or invalid Kani report {path.name}: {error}") from error
 
 
-def discover(crate, work, kani):
-    """Compile current harness metadata without `list`, which writes into the source directory."""
+def compiled(crate, work, kani):
+    """Return each proof harness that Kani compiles in crate's targets, one per target that compiles it.
+
+    It compiles harness metadata without `list`, which writes into the source directory.
+    """
     if not (crate / "Cargo.toml").is_file():
         raise CheckError(f"{crate}/Cargo.toml is missing")
     workspace = kani.cargo_metadata(crate).workspace
@@ -223,25 +233,31 @@ def discover(crate, work, kani):
                        "in production code or a dependency, report the Kani target as not checked; a feature "
                        "attribute would change the production crate.")
         raise CheckError(f"Kani discovery failed:\n{output}")
-    harnesses = {}
+    found = []
     try:
         for metadata in (work / "target").rglob("*.kani-metadata.json"):
             for harness in read_json(metadata)["proof_harnesses"]:
-                if harness["attributes"]["kind"] != "Proof":
-                    continue
-                name = harness["pretty_name"]
-                bound = harness["attributes"].get("unwind_value")
-                should_panic = harness["attributes"].get("should_panic") is True
-                source = harness["original_file"]
-                if not isinstance(name, str) or not name or not isinstance(source, str) or not source:
-                    raise CheckError("malformed Kani harness name or source")
-                if name in harnesses:
-                    raise CheckError("duplicate harness names; select a single crate")
-                if type(bound) is not int or bound < 1:
-                    raise CheckError(f"{name} needs #[kani::unwind(N)] with N greater than zero")
-                harnesses[name] = Harness(bound, (workspace / source).resolve(), should_panic)
+                name, source, attributes = harness["pretty_name"], harness["original_file"], harness["attributes"]
+                if not isinstance(name, str) or not name or not isinstance(source, str) or not source or not isinstance(attributes, dict) or "kind" not in attributes:
+                    raise CheckError("malformed Kani harness name, source or attributes")
+                found.append(Compiled(name, (workspace / source).resolve(), attributes))
     except (KeyError, TypeError, AttributeError) as error:
         raise CheckError(f"malformed Kani discovery record: {error!r}") from error
+    return found
+
+
+def discover(crate, work, kani):
+    """Return the checker's harnesses in crate by name: each `#[kani::proof]` with its unwind bound and source."""
+    harnesses = {}
+    for harness in compiled(crate, work, kani):
+        if harness.attributes.get("kind") != "Proof":
+            continue
+        bound = harness.attributes.get("unwind_value")
+        if harness.name in harnesses:
+            raise CheckError("duplicate harness names; select a single crate")
+        if type(bound) is not int or bound < 1:
+            raise CheckError(f"{harness.name} needs #[kani::unwind(N)] with N greater than zero")
+        harnesses[harness.name] = Harness(bound, harness.source, harness.attributes.get("should_panic") is True)
     if not harnesses:
         raise CheckError("no proof harnesses found")
     return harnesses
