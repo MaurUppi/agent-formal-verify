@@ -28,6 +28,15 @@ function callMermaid(logFile, options = {}) {
   return runPython(script);
 }
 
+// The report's own script is its last plain <script> element. Find it by index: CodeQL flags a regex over HTML as a tag filter.
+function lastInlineScript(html) {
+  const start = html.lastIndexOf("<script>");
+  assert.ok(start >= 0, "expected inline report script");
+  const end = html.indexOf("</script>", start);
+  assert.ok(end > start, "expected the inline report script to end");
+  return html.slice(start + "<script>".length, end);
+}
+
 test("tlc_report.to_mermaid renders invariant trace with state declarations, transitions, and fail class", () => {
   const result = callMermaid("tlc-invariant.log", { kind: "fail", title: "One n=4" });
   assert.equal(result.status, 0, result.stderr);
@@ -640,9 +649,7 @@ test("tlc_report inline copy-mermaid script falls back to execCommand on clipboa
   ].join("\n");
   const rendered = runPython(py);
   assert.equal(rendered.status, 0, rendered.stderr);
-  const scriptMatches = [...rendered.stdout.matchAll(/<script>([\s\S]*?)<\/script>/g)];
-  assert.ok(scriptMatches.length >= 1, "expected inline report script");
-  const inlineJs = scriptMatches[scriptMatches.length - 1][1];
+  const inlineJs = lastInlineScript(rendered.stdout);
 
   async function triggerCopy(execMode) {
     let clickHandler = null;
@@ -726,9 +733,7 @@ test("tlc_report inline script renderStep updates counter, header, diff, snapsho
 
   const dataMatch = htmlDoc.match(/<script type="application\/json" id="trace-data-0">([\s\S]*?)<\/script>/);
   assert.ok(dataMatch, "missing trace-data-0 payload");
-  const scriptMatches = [...htmlDoc.matchAll(/<script>([\s\S]*?)<\/script>/g)];
-  assert.ok(scriptMatches.length >= 1, "expected inline report script");
-  const inlineJs = scriptMatches[scriptMatches.length - 1][1];
+  const inlineJs = lastInlineScript(htmlDoc);
 
   function makeEl(tag = "div") {
     let text = "";
