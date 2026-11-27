@@ -296,7 +296,7 @@ _SCRIPT = """
     const select = () => renderStep(node.dataset.traceId.replace(/^trace-/, ""), Number(node.dataset.stepIndex));
     node.addEventListener("click", select);
     node.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); select(); }
+      if (["Enter", "NumpadEnter", "Space"].includes(ev.code)) { ev.preventDefault(); select(); }
     });
   });
   document.querySelectorAll("button[data-action][data-trace-id]").forEach((btn) => {
